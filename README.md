@@ -20,18 +20,25 @@ extension.
 
 ## What it does
 
-- **Discovery** — every node dials out to the broker; `list_peers` is just the
-  roster the broker pushes.
-- **Two-way messaging** — the model calls the `team_send` tool, or you type
-  `/team say <node> <text>`.
-- **Inbound messages become real turns** — a teammate's message is injected with
-  `sendUserMessage()`, so the model processes it exactly as if you had typed it.
-  Works in the TUI.
+- **Discovery** — every node dials out to the broker, which pushes the roster.
+  Members carry `host` and `tags`, so the TUI groups them by machine.
+- **Several agents per machine** — identity is the node name, not the IP. One
+  server can run `dev01-web` and `dev01-api` side by side. This is why the
+  Tailscale peer list cannot serve as the member table: it only sees machines.
+- **Unicast, multicast, groups** — send to one node, a list (`a,b`), a tag group
+  (`#web`), or everyone (`*`).
+- **Inbound messages become real turns** — a teammate's request is injected with
+  `sendUserMessage()`, so the model processes it as if you had typed it. Works
+  in the TUI.
+- **Sane conversation shape** — a request gets one automatic reply, then stops.
+  Replies carry `re` and are never auto-answered. See
+  [How a message flows](#how-a-message-flows).
 - **Visible in the transcript** — `📥 RECV` / `📤 SEND` / `🔁 REPLY` / `⚠️ FAIL`
-  cards, with peer name and timestamp. Cards are display-only and never enter
-  the model's context (see [Design notes](#design-notes)).
-- **Agent skill included** — the model reads `skills/pi-agent-team/SKILL.md` and
-  knows how to behave in a team.
+  cards, with peer and timestamp. Display-only; they never enter the model's
+  context.
+- **`/team` menu** — run `/team` with no arguments for an interactive menu.
+  Arguments autocomplete node names, `#groups` and subcommands.
+- **Agent skill included** — the model reads `skills/pi-agent-team/SKILL.md`.
 
 ## Requirements
 
@@ -82,10 +89,14 @@ Health check: `curl http://<tailnet-ip>:8787/health`
 
 ```bash
 TEAM_URL=ws://<tailnet-ip>:8787 \
-TEAM_NAME=laptop \
+TEAM_NAME=laptop-web \
+TEAM_TAGS=web,frontend \
 TEAM_TOKEN=<the token> \
   pi --extension /path/to/pi-agent-team/index.ts
 ```
+
+`TEAM_NAME` must be unique across the team. `TEAM_TAGS` is optional and used for
+group sends. Multiple PIs on one machine just need different names.
 
 Or install as a Pi package:
 
@@ -96,48 +107,69 @@ pi install git:github.com/Yiki21/pi-agent-team
 ### 3. Verify
 
 ```
-/team status     # node name, connection, broker, peers, announce mode
-/team peers      # who is online
-/team say other  hello from laptop
+/team            # interactive menu
+/team peers      # who is online, grouped by machine
+/team send other hello from laptop
+/team send "#web" deploy is starting
+/team send '*' maintenance in 5 minutes
 ```
 
-The other side sees the message arrive as a `📥 RECV` card, and its next turn's
-output is sent back to you automatically.
+The other side sees a `📥 RECV` card, and its next turn's output is sent back to
+you automatically.
 
 ## Commands
 
+Run `/team` with no arguments for a menu; the subcommands below are for when you
+already know what you want.
+
 | Command | What it does |
 |---|---|
-| `/team status` | Node name, connection state, broker URL, peers, announce mode |
-| `/team peers` | List online nodes |
-| `/team say <name\|all> <text>` | Send manually |
+| `/team` | Interactive menu: members, send, broadcast, announce mode, status |
+| `/team status` | Node name, tags, connection, broker URL, peer count, announce mode |
+| `/team peers` | Online nodes grouped by machine, plus available `#groups` |
+| `/team send <to> <text>` | Send. `to` = name, `a,b`, `#tag`, or `*` |
 | `/team announce <off\|auto\|always>` | Set the auto-push mode |
 | `/team on` / `/team off` | Shorthand for `announce auto` / `announce off` |
+
+Sending to more than 5 recipients asks for confirmation first — each recipient
+costs a full model turn.
 
 ### Auto-push modes
 
 | Mode | Behaviour |
 |---|---|
-| `off` | Only sends on `/team say` or an explicit `team_send` |
-| `auto` *(default)* | Also replies to the peer whose message triggered the current turn |
-| `always` | Pushes every turn's output to all online nodes |
+| `off` | Only sends on an explicit `/team send` or `team_send` |
+| `auto` *(default)* | Also replies once to the peer whose request triggered this turn |
+| `always` | Mirrors every turn's output to all online nodes, as `fyi` |
 
-`always` on two nodes makes them talk to each other indefinitely, each burning
-its own tokens. That is why it is not the default.
+`always` marks its messages `fyi`, so recipients show a card without waking their
+model. Without that, N nodes on `always` would each trigger N-1 extra turns per
+round.
 
 ## How a message flows
 
 ```
-A's model calls team_send({ to: "B", text: "..." })
-   → broker routes to B
-   → B injects "[来自 A 的 team 消息] ..." via sendUserMessage()
-   → B's model runs a normal turn
-   → B's output is sent back to A (announce=auto)
-   → A injects it the same way
+A → B   request   (no re)
+          B runs a turn, its output goes back to A automatically
+
+B → A   reply     (re = A's request id)
+          A shows the reply. It does NOT auto-answer, so the exchange ends.
+
+A(model) → B ...    if A wants to continue, its model calls team_send explicitly
 ```
 
-Messages carry a hop count. At 4 hops the chain stops, so an echo between two
-`always` nodes cannot run forever.
+Rules, enforced by `src/policy.js` and covered by tests:
+
+| Inbound | Action |
+|---|---|
+| Request (`re` empty) | Inject into the model; auto-reply once |
+| Reply to something the **model** sent | Inject, with the original quoted; no auto-reply |
+| Reply to something **you** sent via `/team send` | Card only — the model never saw your message, so waking it would just confuse it |
+| Reply whose original is unknown (e.g. after a restart) | Inject; no auto-reply |
+| `fyi` broadcast (`announce=always`) | Card only |
+
+Messages carry a hop count and stop at 4. That is a backstop, not the mechanism —
+the shape above is what actually terminates a conversation.
 
 ## Security model
 
@@ -207,13 +239,11 @@ under test.
 
 - **Broker restart drops all connections.** Clients reconnect with exponential
   backoff, but messages in flight are lost.
-- **Name collision.** A second node using a live node's name is rejected with
-  `409`. The old connection keeps the name until its heartbeat expires (default
-  30 s). Kicking the old connection instead would be friendlier, but it also
-  means anyone holding the token can evict any node — an open decision.
-- **No message persistence, no delivery receipts beyond "written to the peer's
-  socket."** A successful send does not mean the peer's model processed it.
+- **Same-name takeover evicts the older connection.** A second node using a live node's name takes it over; the older one is closed with code `4001` and stops reconnecting (it would otherwise fight the new one forever). Anyone holding the token can therefore evict any node. The token is the only credential and it never leaves your tailnet, so that is accepted. Set `TEAM_NO_TAKEOVER=1` on the broker for the old `409 Conflict` behaviour.
+- **No message persistence, no delivery receipts beyond "written to the peer's socket."** A successful send does not mean the peer's model processed it.
+- **One pending auto-reply per node.** If two requests arrive while the model is busy, both are processed, but only one auto-reply goes out — to whichever arrived last. The other sender gets no automatic answer.
 - **The roster is global.** All nodes are in one team; there are no rooms.
+- **Tags are a convention.** Nothing checks that `#web` means the same thing on every node.
 
 ## Contributing
 

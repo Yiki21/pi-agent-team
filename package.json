@@ -23,8 +23,12 @@
     "pi-agent-team-broker": "./broker.mjs"
   },
   "pi": {
-    "extensions": ["./index.ts"],
-    "skills": ["./skills"]
+    "extensions": [
+      "./index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
   },
   "files": [
     "broker.mjs",

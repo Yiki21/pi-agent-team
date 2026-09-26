@@ -8,10 +8,13 @@
  *  - 所有节点主动 dial out 到 broker,完全对称,没有 leader 选举。
  *    代价是 broker 是单点 —— 但它挂了两边 Pi 各自照常工作,
  *    只是跨机消息不通。这个失败模式可以接受。
- *  - 不做 TLS:只监听 tailscale 接口,链路已被 WireGuard 加密。
- *    再叠一层只是多一份证书要管。
+ *  - 不做 TLS:只监听 tailnet 接口,链路已被 WireGuard 加密。
  *  - 不做离线队列:对端离线立刻回执 undeliverable。
  *    静默排队会让"对方到底收没收到"变成不可知。
+ *  - 同名接管:同名新连接踢掉旧连接。同名几乎总是意味着旧进程
+ *    已经死了或被 tmux kill 掉而心跳还没超时 —— 让新实例干等
+ *    30 秒是更差的行为。代价是持 token 者可顶掉任意节点;
+ *    token 本身就是唯一凭证,而且只在 tailnet 内,可接受。
  *
  * 用法:
  *   TEAM_TOKEN=xxx node broker.mjs --bind $(tailscale ip -4)
@@ -53,6 +56,13 @@ if (args.help) {
 const TOKEN = process.env.TEAM_TOKEN;
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
 
+/** 一个节点最多声明多少个 tag,防止滥用 */
+const MAX_TAGS = 8;
+const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
+
+/** 关闭码:被同名新连接顶掉。客户端收到它不应该重连。 */
+const CLOSE_REPLACED = 4001;
+
 if (!TOKEN) {
   console.error("拒绝启动:必须设置 TEAM_TOKEN。没有 token 的 broker 是敞开的。");
   process.exit(1);
@@ -69,7 +79,12 @@ if (args.bind === "0.0.0.0" || args.bind === "::") {
 
 // ------------------------------------------------------------------ 状态
 
-/** @type {Map<string, {name: string, socket: import('node:net').Socket, since: number, alive: boolean}>} */
+/**
+ * @type {Map<string, {
+ *   name: string, socket: import('node:net').Socket, since: number,
+ *   alive: boolean, tags: string[], host: string | null, addr: string | null
+ * }>}
+ */
 const peers = new Map();
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -92,10 +107,25 @@ function write(socket, obj) {
   }
 }
 
-// roster 是"当前所有在线节点",不排除任何人。
-// 排除谁应该由接收方自己决定 —— 之前我在广播时排除了新加入者,
-// 导致每个接收方拿到的名单都不一样(测试抓到的就是这个)。
-const roster = () => [...peers.keys()];
+/**
+ * 成员快照。
+ *
+ * 返回对象而不是名字数组 —— 因为客户端需要 host 和 tags 才能
+ * 分组显示和做 #tag 群发。名字数组是这套信息的退化形式。
+ */
+function members() {
+  return [...peers.values()].map((p) => ({
+    name: p.name,
+    host: p.host,
+    addr: p.addr,
+    tags: p.tags,
+    since: p.since,
+  }));
+}
+
+function nameList() {
+  return [...peers.keys()];
+}
 
 let sysSeq = 0;
 function sys(body, to = "*", re = null) {
@@ -115,12 +145,94 @@ function broadcast(obj, exceptName) {
   }
 }
 
+// ------------------------------------------------------------------ 收件人解析
+
+/**
+ * 把信封的 `to` 解析成实际收件人名单。
+ *
+ * 支持四种形态:
+ *   "name"                   单个节点
+ *   "*"                      除发送者外的所有人
+ *   ["a","b"]                显式多收件人
+ *   "#tag" / ["#tag","a"]    按 tag 分组(会和显式名字去重合并)
+ *
+ * @returns {{ targets: string[], unknown: string[], empty: string[] }}
+ *   targets  实际能投递的节点名
+ *   unknown  指了但不存在的名字或空分组
+ *   empty    [] —— 保留字段,语义上等于 unknown 里的分组
+ */
+function resolveTargets(to, senderName) {
+  const requested = Array.isArray(to) ? to : [to];
+  const targets = new Set();
+  const unknown = [];
+
+  for (const raw of requested) {
+    if (typeof raw !== "string") continue;
+    const t = raw.trim();
+    if (!t) continue;
+
+    if (t === "*") {
+      for (const name of peers.keys()) if (name !== senderName) targets.add(name);
+      continue;
+    }
+
+    if (t.startsWith("#")) {
+      const tag = t.slice(1);
+      let matched = 0;
+      for (const p of peers.values()) {
+        if (p.name === senderName) continue;
+        if (p.tags.includes(tag)) {
+          targets.add(p.name);
+          matched++;
+        }
+      }
+      // 空分组要报出来,否则发送方以为"发给了全部 web 节点",
+      // 实际一个都没匹配到却显示成功。
+      if (matched === 0) unknown.push(t);
+      continue;
+    }
+
+    if (!peers.has(t)) {
+      unknown.push(t);
+      continue;
+    }
+    targets.add(t);
+  }
+
+  return { targets: [...targets], unknown };
+}
+
 // ------------------------------------------------------------------ 握手
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-/** @returns {string | null} 通过校验的节点名 */
-function handshake(req, socket) {
+function reject(socket, code, reason) {
+  socket.write(`HTTP/1.1 ${code} ${reason}\r\nConnection: close\r\n\r\n`);
+  socket.destroy();
+  return null;
+}
+
+function parseTags(raw) {
+  if (!raw) return [];
+  const seen = new Set();
+  for (const part of raw.split(",")) {
+    const t = part.trim();
+    if (!t || t.length > 32) continue;
+    if (!TAG_RE.test(t)) continue;
+    seen.add(t);
+    if (seen.size >= MAX_TAGS) break;
+  }
+  return [...seen];
+}
+
+/**
+ * 握手。
+ *
+ * @param {boolean} allowTakeover 是否允许顶掉同名旧连接。
+ *   e2e 里可以关掉来测"冲突被拒"这条路径,但生产默认开。
+ * @returns {{ name: string, tags: string[], host: string | null } | null}
+ */
+function handshake(req, socket, allowTakeover) {
   if ((req.headers.upgrade ?? "").toLowerCase() !== "websocket") {
     socket.destroy();
     return null;
@@ -129,27 +241,36 @@ function handshake(req, socket) {
   const url = new URL(req.url ?? "/", "http://placeholder");
   const name = (url.searchParams.get("name") ?? "").trim();
 
-  const reject = (code, reason) => {
-    socket.write(`HTTP/1.1 ${code} ${reason}\r\nConnection: close\r\n\r\n`);
-    socket.destroy();
-    return null;
-  };
-
   if (!tokenOk(url.searchParams.get("token"))) {
     log(`拒绝:token 错误 (fp=${fingerprint})`);
-    return reject(401, "Unauthorized");
+    return reject(socket, 401, "Unauthorized");
   }
   if (!NAME_RE.test(name)) {
     log(`拒绝:非法名字 ${JSON.stringify(name)}`);
-    return reject(400, "Bad Request");
+    return reject(socket, 400, "Bad Request");
   }
-  if (peers.has(name)) {
-    log(`拒绝:名字占用 ${name}`);
-    return reject(409, "Conflict");
+
+  // 同名接管:踢掉旧连接,让新连接接管这个名字。
+  const existing = peers.get(name);
+  if (existing) {
+    if (!allowTakeover) {
+      log(`拒绝:名字占用 ${name}`);
+      return reject(socket, 409, "Conflict");
+    }
+    log(`接管:${name}(踢掉旧连接,它已在线 ${Math.round((Date.now() - existing.since) / 1000)}s)`);
+    // 先从表里摘掉,再关 socket —— 顺序很重要。
+    // 反过来的话,旧 socket 的 close 处理器会看到 peers.get(name)
+    // 仍是自己,于是广播一条假的 peer_left。
+    peers.delete(name);
+    try {
+      existing.socket.write(closeFrame(CLOSE_REPLACED));
+      existing.socket.end();
+    } catch {}
+    // 不广播 peer_left:对其他人来说这个节点一直在,只是换了条连接。
   }
 
   const key = req.headers["sec-websocket-key"];
-  if (typeof key !== "string") return reject(400, "Bad Request");
+  if (typeof key !== "string") return reject(socket, 400, "Bad Request");
 
   const accept = createHash("sha1").update(key + WS_GUID).digest("base64");
   socket.write(
@@ -160,7 +281,13 @@ function handshake(req, socket) {
   );
   socket.setNoDelay?.(true);
   socket.setTimeout?.(0);
-  return name;
+
+  const host = url.searchParams.get("host");
+  return {
+    name,
+    tags: parseTags(url.searchParams.get("tags")),
+    host: host && host.length <= 64 ? host : null,
+  };
 }
 
 // ------------------------------------------------------------------ 消息
@@ -193,44 +320,69 @@ function handleMessage(name, socket, text) {
     env.from = name;
   }
 
-  if (env.to === "*") {
-    let n = 0;
-    for (const [peerName, peer] of peers) {
-      if (peerName === name) continue;
-      if (write(peer.socket, env)) n++;
+  const toDesc = Array.isArray(env.to) ? env.to.join(",") : String(env.to);
+  if (typeof env.to !== "string" && !Array.isArray(env.to)) {
+    log(`丢弃:${name} 的 to 类型非法`);
+    return;
+  }
+
+  const { targets, unknown } = resolveTargets(env.to, name);
+
+  if (targets.length === 0) {
+    write(
+      socket,
+      sys({ kind: "undeliverable", reason: unknown.length ? "unknown_recipient" : "no_recipients", to: toDesc, unknown }, name, env.id),
+    );
+    log(`${name} → ${toDesc}:无可投递对象${unknown.length ? `(未知:${unknown.join(",")})` : ""}`);
+    return;
+  }
+
+  let delivered = 0;
+  const failed = [];
+  for (const target of targets) {
+    const peer = peers.get(target);
+    if (!peer || !write(peer.socket, env)) {
+      failed.push(target);
+      continue;
     }
-    log(`${name} 广播 → ${n} 个对端`);
-    return;
+    delivered++;
   }
 
-  if (typeof env.to !== "string" || env.to.length === 0) {
-    log(`丢弃:${name} 的 to 非法`);
-    return;
-  }
+  // 单播保持和以前一样:delivered 直接对应该收件人。
+  // 群发时给出汇总,并列出没成功的。
+  write(
+    socket,
+    sys(
+      {
+        kind: delivered === 0 ? "undeliverable" : "delivered",
+        to: toDesc,
+        delivered,
+        total: targets.length,
+        ...(failed.length ? { failed } : {}),
+        ...(unknown.length ? { unknown } : {}),
+        ...(delivered === 0 ? { reason: "write_failed" } : {}),
+      },
+      name,
+      env.id,
+    ),
+  );
 
-  const target = peers.get(env.to);
-  if (!target) {
-    write(socket, sys({ kind: "undeliverable", reason: "offline", to: env.to }, name, env.id));
-    log(`${name} → ${env.to}:离线`);
-    return;
-  }
-  if (!write(target.socket, env)) {
-    write(socket, sys({ kind: "undeliverable", reason: "write_failed", to: env.to }, name, env.id));
-    return;
-  }
-
-  // 回执只证明"写进了对端 socket",不证明对端 LLM 处理了。
-  // 命名上刻意区分,避免调用方误读。
-  write(socket, sys({ kind: "delivered", to: env.to }, name, env.id));
-  log(`${name} → ${env.to} ok (id=${env.id.slice(0, 8)})`);
+  log(
+    `${name} → ${toDesc}:投递 ${delivered}/${targets.length}` +
+      (failed.length ? ` 失败:${failed.join(",")}` : "") +
+      (unknown.length ? ` 未知:${unknown.join(",")}` : ""),
+  );
 }
 
 // ------------------------------------------------------------------ HTTP
 
 const server = createServer((req, res) => {
-  if ((req.url ?? "").split("?")[0] === "/health") {
+  const path = (req.url ?? "").split("?")[0];
+  if (path === "/health") {
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, count: peers.size, peers: [...peers.keys()] }));
+    // peers 保留为名字数组(简单、稳定);members 是完整快照。
+    // 两个都给,免得改一处就破一个监控脚本。
+    res.end(JSON.stringify({ ok: true, count: peers.size, peers: nameList(), members: members() }));
     return;
   }
   res.writeHead(404, { "content-type": "text/plain" });
@@ -239,13 +391,18 @@ const server = createServer((req, res) => {
 
 // ------------------------------------------------------------------ 连接
 
+// 允许通过环境变量关闭接管,只为测试"冲突被拒"这条路径存在。
+const ALLOW_TAKEOVER = process.env.TEAM_NO_TAKEOVER !== "1";
+
 server.on("upgrade", (req, socket) => {
-  const name = handshake(req, socket);
-  if (!name) return;
+  const info = handshake(req, socket, ALLOW_TAKEOVER);
+  if (!info) return;
+
+  const { name, tags, host } = info;
 
   const touch = () => {
     const p = peers.get(name);
-    if (p) p.alive = true;
+    if (p && p.socket === socket) p.alive = true;
   };
 
   const reader = new FrameReader({
@@ -271,17 +428,29 @@ server.on("upgrade", (req, socket) => {
   });
   socket.on("error", () => {});
   socket.on("close", () => {
+    // 只有"当前占用这个名字的 socket"才有资格宣布离开。
+    // 被接管时 handshake 已经把名字摘走了,所以这里会直接返回 ——
+    // 这正是防止假 peer_left 抖动的那个判断。
     if (peers.get(name)?.socket !== socket) return;
     peers.delete(name);
     log(`离开:${name}(在线 ${peers.size})`);
-    broadcast(sys({ kind: "peer_left", peer: name, peers: roster() }));
+    broadcast(sys({ kind: "peer_left", peer: name, peers: nameList(), members: members() }));
   });
 
-  peers.set(name, { name, socket, since: Date.now(), alive: true });
-  log(`加入:${name}(在线 ${peers.size})`);
+  const remote = socket.remoteAddress ?? null;
+  peers.set(name, {
+    name,
+    socket,
+    since: Date.now(),
+    alive: true,
+    tags,
+    host,
+    addr: remote,
+  });
+  log(`加入:${name}(在线 ${peers.size})${tags.length ? ` tags=${tags.join(",")}` : ""}${host ? ` host=${host}` : ""}`);
 
-  write(socket, sys({ kind: "welcome", peer: name, peers: roster().filter((n) => n !== name) }));
-  broadcast(sys({ kind: "peer_joined", peer: name, peers: roster() }), name);
+  write(socket, sys({ kind: "welcome", peer: name, peers: nameList().filter((n) => n !== name), members: members() }));
+  broadcast(sys({ kind: "peer_joined", peer: name, peers: nameList(), members: members() }), name);
 });
 
 // 心跳:探活并踢掉半死连接。没有它,拔网线的客户端会永远留在
@@ -314,7 +483,7 @@ function socketWritePing(socket) {
 server.listen(args.port, args.bind, () => {
   log(`broker 监听 ws://${args.bind}:${args.port}`);
   log(`token 指纹 ${fingerprint}(日志核对用,不是 token 本身)`);
-  log(`节点连接:ws://${args.bind}:${args.port}?name=<name>&token=<TEAM_TOKEN>`);
+  log(`接管模式 ${ALLOW_TAKEOVER ? "开(同名新连接踢旧连接)" : "关(同名返回 409)"}`);
 });
 
 function shutdown(signal) {

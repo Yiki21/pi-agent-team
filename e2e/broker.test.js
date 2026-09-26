@@ -24,15 +24,22 @@ const allocPort = () => nextPort++;
 /**
  * 起一个隔离的 broker,返回一个带 connect/close 的测试上下文。
  */
-async function withBroker(t) {
+async function withBroker(t, { noTakeover = false, heartbeat = 2000 } = {}) {
   const port = allocPort();
   const base = `ws://127.0.0.1:${port}`;
   const sockets = [];
 
   const broker = spawn(
     process.execPath,
-    [BROKER, "--bind", "127.0.0.1", "--port", String(port), "--heartbeat", "2000"],
-    { env: { ...process.env, TEAM_TOKEN: TOKEN }, stdio: ["ignore", "pipe", "pipe"] },
+    [BROKER, "--bind", "127.0.0.1", "--port", String(port), "--heartbeat", String(heartbeat)],
+    {
+      env: {
+        ...process.env,
+        TEAM_TOKEN: TOKEN,
+        ...(noTakeover ? { TEAM_NO_TAKEOVER: "1" } : {}),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
   );
 
   await new Promise((resolve, reject) => {
@@ -49,16 +56,30 @@ async function withBroker(t) {
     });
   });
 
- /** 连一个假节点;正确 token 时等到 welcome。 */
-  const connect = async (name, token = TOKEN) => {
-    const ws = new WebSocket(`${base}?name=${encodeURIComponent(name)}&token=${encodeURIComponent(token)}`);
+  /**
+   * 连一个节点。
+   * @param name 节点名
+   * @param opts.token 覆盖 token
+   * @param opts.tags tag 列表(逗号分隔)
+   * @param opts.host 机器名
+   * @param opts.expectClose 预期被关闭(接管/拒绝场景),等 close 再返回
+   */
+  const connect = async (name, opts = {}) => {
+    const { token = TOKEN, tags = "", host = "", expectClose = false } = opts;
+    const qs = new URLSearchParams({ name, token });
+    if (tags) qs.set("tags", tags);
+    if (host) qs.set("host", host);
+
+    const ws = new WebSocket(`${base}?${qs}`);
     sockets.push(ws);
     const inbox = [];
+    const closes = [];
     ws.addEventListener("message", (ev) => inbox.push(JSON.parse(ev.data)));
+    ws.addEventListener("close", (ev) => closes.push({ code: ev.code }));
 
-    if (token !== TOKEN) {
+    if (token !== TOKEN || expectClose) {
       await Promise.race([once(ws, "close"), once(ws, "error")]);
-      return { ws, inbox, rejected: true };
+      return { ws, inbox, closes, rejected: true };
     }
 
     await new Promise((resolve, reject) => {
@@ -75,7 +96,7 @@ async function withBroker(t) {
       });
     });
 
-    return { ws, inbox, rejected: false };
+    return { ws, inbox, closes, rejected: false };
   };
 
   const cleanup = async () => {
@@ -115,7 +136,7 @@ test("正确 token 能连上并收到 welcome", async (t) => {
 
 test("错误 token 被拒绝", async (t) => {
   const { connect } = await withBroker(t);
-  const bad = await connect("intruder", "wrong-token");
+  const bad = await connect("intruder", { token: "wrong-token" });
   assert.equal(bad.rejected, true, "错误的 token 必须连不上");
 });
 
@@ -177,7 +198,11 @@ test("广播:一次发给所有其他节点,不回声给自己", async (t) => {
   assert.equal(a.inbox.find((m) => m.id === id), undefined, "广播不应回声给自己");
 });
 
-test("离线对端:立刻回执 undeliverable,不静默排队", async (t) => {
+// 注意语义变化:早期版本把"收件人不在线"回执为 reason:"offline",
+// 但 broker 不维护任何持久成员表,它无法区分"下线了"和"从未存在过"。
+// 现在统一用 unknown_recipient —— 这是诚实的那一个。友好措辞
+// ("不在线或不存在")由扩展层负责。
+test("离线对端:立刻回执,不静默排队", async (t) => {
   const { connect } = await withBroker(t);
   const a = await connect("d1");
   const id = "gone-1";
@@ -185,7 +210,8 @@ test("离线对端:立刻回执 undeliverable,不静默排队", async (t) => {
 
   const reply = await waitFor(() => a.inbox.find((m) => m.re === id));
   assert.equal(reply.body.kind, "undeliverable");
-  assert.equal(reply.body.reason, "offline");
+  assert.equal(reply.body.reason, "unknown_recipient");
+  assert.deepEqual(reply.body.unknown, ["nobody-here"]);
 });
 
 test("from 伪造被覆盖为真实连接身份", async (t) => {
@@ -212,15 +238,17 @@ test("畸形信封被丢弃,不导致崩溃", async (t) => {
   assert.equal(b.rejected, false, "畸形输入不应让 broker 失去服务能力");
 });
 
-test("名字冲突被拒绝", async (t) => {
-  const { base, connect } = await withBroker(t);
+// 默认是接管语义;"拒绝冲突"只在 TEAM_NO_TAKEOVER=1 时生效。
+// 保留两条路径的测试,因为拒绝路径是接管逻辑的对照组。
+test("名字冲突:关闭接管时返回 409", async (t) => {
+  const { base, connect } = await withBroker(t, { noTakeover: true });
   await connect("dup");
 
   const second = new WebSocket(`${base}?name=dup&token=${encodeURIComponent(TOKEN)}`);
   await Promise.race([once(second, "close"), once(second, "error")]);
   assert.ok(
     second.readyState === WebSocket.CLOSED || second.readyState === WebSocket.CLOSING,
-    "重复名字必须被拒绝",
+    "接管关闭时,重复名字必须被拒绝",
   );
 });
 
@@ -264,4 +292,163 @@ test("多字节 UTF-8 消息跨 WebSocket 完整传输", async (t) => {
 
   const got = await waitFor(() => b.inbox.find((m) => m.id === "utf8-1"));
   assert.equal(got.body.text, text);
+});
+
+// ================================================================ 同名接管
+
+test("同名接管:新连接踢掉旧连接,旧连接收到 4001", async (t) => {
+  const { connect } = await withBroker(t);
+  const old = await connect("worker");
+
+  const fresh = await connect("worker");
+  assert.equal(fresh.rejected, false, "新连接必须被接受");
+
+  // 旧连接应被 broker 用 4001 关闭 —— 客户端靠这个码判断"不要重连"
+  await waitFor(() => old.closes.length > 0);
+  assert.equal(old.closes[0].code, 4001, "被顶掉的连接应收到 4001 replaced");
+});
+
+test("同名接管:其他节点不会看到 peer_left 抖动", async (t) => {
+  const { connect } = await withBroker(t);
+  const watcher = await connect("watcher");
+  await connect("worker");
+  await waitFor(() => watcher.inbox.some((m) => m.body?.kind === "peer_joined" && m.body.peer === "worker"));
+
+  const before = watcher.inbox.length;
+  await connect("worker"); // 接管
+  // 给 broker 时间把任何假事件发出来
+  await new Promise((r) => setTimeout(r, 300));
+
+  const after = watcher.inbox.slice(before);
+  const left = after.filter((m) => m.body?.kind === "peer_left" && m.body.peer === "worker");
+  assert.equal(left.length, 0, "接管不应广播 peer_left —— 对观察者来说节点一直在线");
+});
+
+test("同名接管:消息投递到新连接,不投旧连接", async (t) => {
+  const { connect } = await withBroker(t);
+  const sender = await connect("sender");
+  const old = await connect("target");
+  const fresh = await connect("target");
+  await waitFor(() => old.closes.length > 0);
+
+  sender.ws.send(JSON.stringify({ from: "sender", to: "target", id: "after-takeover", re: null, body: { text: "hi" } }));
+
+  assert.ok(await waitFor(() => fresh.inbox.find((m) => m.id === "after-takeover")), "新连接必须收到");
+  assert.equal(old.inbox.find((m) => m.id === "after-takeover"), undefined, "旧连接不应收到");
+});
+
+// ================================================================ 群发
+
+test("群发:显式收件人数组", async (t) => {
+  const { connect } = await withBroker(t);
+  const a = await connect("a");
+  const b = await connect("b");
+  const c = await connect("c");
+  const d = await connect("d");
+  await waitFor(() => a.inbox.filter((m) => m.body?.kind === "peer_joined").length >= 3);
+
+  a.ws.send(JSON.stringify({ from: "a", to: ["b", "c"], id: "multi-1", re: null, body: { text: "b 和 c" } }));
+
+  assert.ok(await waitFor(() => b.inbox.find((m) => m.id === "multi-1")));
+  assert.ok(await waitFor(() => c.inbox.find((m) => m.id === "multi-1")));
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(d.inbox.find((m) => m.id === "multi-1"), undefined, "d 不在收件人里");
+  assert.equal(a.inbox.find((m) => m.id === "multi-1"), undefined, "发送者不应收到自己的消息");
+
+  const ack = await waitFor(() => a.inbox.find((m) => m.re === "multi-1"));
+  assert.equal(ack.body.kind, "delivered");
+  assert.equal(ack.body.delivered, 2);
+  assert.equal(ack.body.total, 2);
+});
+
+test("群发:#tag 分组", async (t) => {
+  const { connect } = await withBroker(t);
+  const lead = await connect("lead");
+  const w1 = await connect("web1", { tags: "web,frontend" });
+  const w2 = await connect("web2", { tags: "web" });
+  const db = await connect("db1", { tags: "db" });
+  await waitFor(() => lead.inbox.filter((m) => m.body?.kind === "peer_joined").length >= 3);
+
+  lead.ws.send(JSON.stringify({ from: "lead", to: "#web", id: "tag-1", re: null, body: { text: "web 组" } }));
+
+  assert.ok(await waitFor(() => w1.inbox.find((m) => m.id === "tag-1")));
+  assert.ok(await waitFor(() => w2.inbox.find((m) => m.id === "tag-1")));
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(db.inbox.find((m) => m.id === "tag-1"), undefined, "db 组不该收到 #web");
+});
+
+test("群发:tag 和名字混合且去重", async (t) => {
+  const { connect } = await withBroker(t);
+  const lead = await connect("lead");
+  const w1 = await connect("web1", { tags: "web" });
+  await connect("db1", { tags: "db" });
+  await waitFor(() => lead.inbox.filter((m) => m.body?.kind === "peer_joined").length >= 2);
+
+  // web1 既在 #web 里又被显式点名 —— 只应收到一次
+  lead.ws.send(JSON.stringify({ from: "lead", to: ["#web", "web1"], id: "dedupe-1", re: null, body: { text: "x" } }));
+  await waitFor(() => w1.inbox.find((m) => m.id === "dedupe-1"));
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(w1.inbox.filter((m) => m.id === "dedupe-1").length, 1, "同一收件人只应收到一次");
+
+  const ack = await waitFor(() => lead.inbox.find((m) => m.re === "dedupe-1"));
+  assert.equal(ack.body.total, 1);
+});
+
+test("群发:空分组要报出来,不能假装成功", async (t) => {
+  const { connect } = await withBroker(t);
+  const lead = await connect("lead");
+  await connect("web1", { tags: "web" });
+  await waitFor(() => lead.inbox.some((m) => m.body?.kind === "peer_joined"));
+
+  lead.ws.send(JSON.stringify({ from: "lead", to: "#nobody", id: "empty-1", re: null, body: { text: "?" } }));
+  const ack = await waitFor(() => lead.inbox.find((m) => m.re === "empty-1"));
+  assert.equal(ack.body.kind, "undeliverable");
+  assert.deepEqual(ack.body.unknown, ["#nobody"]);
+});
+
+test("群发:部分收件人未知时,已知的照投,并报告未知的", async (t) => {
+  const { connect } = await withBroker(t);
+  const a = await connect("a");
+  const b = await connect("b");
+  await waitFor(() => a.inbox.some((m) => m.body?.kind === "peer_joined"));
+
+  a.ws.send(JSON.stringify({ from: "a", to: ["b", "ghost"], id: "partial-1", re: null, body: { text: "x" } }));
+  assert.ok(await waitFor(() => b.inbox.find((m) => m.id === "partial-1")));
+
+  const ack = await waitFor(() => a.inbox.find((m) => m.re === "partial-1"));
+  assert.equal(ack.body.kind, "delivered");
+  assert.equal(ack.body.delivered, 1);
+  assert.deepEqual(ack.body.unknown, ["ghost"]);
+});
+
+// ================================================================ 成员元数据
+
+test("成员元数据:welcome 带 host / tags,同一机器可有多个节点", async (t) => {
+  const { connect } = await withBroker(t);
+  // 同一台机器上两个 agent —— 身份是名字,不是 IP
+  await connect("dev01-frontend", { host: "dev01", tags: "web" });
+  await connect("dev01-backend", { host: "dev01", tags: "api" });
+  const laptop = await connect("laptop", { host: "laptop" });
+
+  const welcome = laptop.inbox.find((m) => m.body?.kind === "welcome");
+  const byName = Object.fromEntries(welcome.body.members.map((m) => [m.name, m]));
+
+  assert.equal(byName["dev01-frontend"].host, "dev01");
+  assert.equal(byName["dev01-backend"].host, "dev01");
+  assert.deepEqual(byName["dev01-frontend"].tags, ["web"]);
+  assert.deepEqual(byName["dev01-backend"].tags, ["api"]);
+  assert.equal(byName["dev01-frontend"].addr, byName["dev01-backend"].addr, "同机两个节点来源地址相同");
+});
+
+test("成员元数据:非法 tag 被丢弃,数量有上限", async (t) => {
+  const { connect } = await withBroker(t);
+  const many = Array.from({ length: 20 }, (_, i) => `t${i}`).join(",");
+  await connect("tagger", { tags: `ok,bad tag!,${many}` });
+  const obs = await connect("obs");
+
+  const welcome = obs.inbox.find((m) => m.body?.kind === "welcome");
+  const tagger = welcome.body.members.find((m) => m.name === "tagger");
+  assert.ok(tagger.tags.includes("ok"));
+  assert.ok(!tagger.tags.includes("bad tag!"), "含空格/感叹号的 tag 应被丢弃");
+  assert.ok(tagger.tags.length <= 8, `tag 数量应有上限,实际 ${tagger.tags.length}`);
 });
