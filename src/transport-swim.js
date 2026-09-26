@@ -65,6 +65,8 @@ export function createSwimTransport({
 
   let sidecar = null;
   let sidecarUrl = null;
+  /** 边车实际绑定的 gossip 端口 —— 用户需要它当种子 */
+  let boundGossipPort = null;
   /** SWIM 给的成员(权威) */
   let swimMembers = [];
   /** 合并了投递端点的最终视图 */
@@ -114,7 +116,16 @@ export function createSwimTransport({
     let stdout = "";
     let stderr = "";
     sidecar.stdout.on("data", (d) => (stdout += d));
-    sidecar.stderr.on("data", (d) => (stderr += d));
+    sidecar.stderr.on("data", (d) => {
+      stderr += d;
+      // 从 memberlist 的日志里抓真实绑定的 gossip 端口。
+      // 内核分配端口时(-port 0)这是我们唯一能知道它的途径,
+      // 而用户需要它当种子地址。
+      if (boundGossipPort === null) {
+        const m = d.toString().match(/bind port (\d+)/i);
+        if (m) boundGossipPort = Number(m[1]);
+      }
+    });
 
     sidecar.on("exit", (code) => {
       if (stopped) return;
@@ -312,5 +323,10 @@ export function createSwimTransport({
     /** 诊断用 */
     sidecarUrl: () => sidecarUrl,
     deliverPort: () => mesh?.port() ?? null,
+    /** 种子地址用的是 gossip 端口,不是投递端口 */
+    gossipPort: () => boundGossipPort,
+    // index.ts 的状态显示统一读 port() —— 三种模式都提供,
+    // 否则 mesh/swim 会显示"未就绪",而用户正是靠这个数字当种子。
+    port: () => mesh?.port() ?? null,
   };
 }

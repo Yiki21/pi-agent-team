@@ -29,7 +29,8 @@ import { hostname } from "node:os";
 import { Type } from "typebox";
 
 import { createBrokerTransport, CLOSE_REPLACED } from "./src/transport.js";
-import { createSessionState, handleIncoming, knownLabels, onTurnSettled, others, teamSize } from "./src/session.js";
+import { MODES, createTransport, modeReadiness, normalizeSeeds, resolveMode } from "./src/mode.js";
+import { createSessionState, handleIncoming, knownLabels, onTurnSettled, others, teamSize, applyRoster } from "./src/session.js";
 import { createTeam, joinTeam, leaveTeam, listTeams, readTeam, toSocketUrl } from "./src/team-config.js";
 import { BULK_WARN_THRESHOLD, dispatch, doSend, sendMessage } from "./src/dispatch.js";
 
@@ -46,7 +47,14 @@ type ConnState = "offline" | "connecting" | "online" | "replaced";
 // ---------------------------------------------------------------- 运行时
 
 let state = createSessionState();
+/**
+ * 当前 transport。三种模式共用同一套接口,所以类型是结构化的。
+ * 具体实现见 src/mode.js 的工厂。
+ */
 let transport: ReturnType<typeof createBrokerTransport> | null = null;
+
+/** 当前模式,用于状态显示和诊断 */
+let currentMode: string = "broker";
 let connState: ConnState = "offline";
 let currentTeam: string | null = null;
 let currentConfig: { url: string; token: string; labels?: string[] } | null = null;
@@ -55,7 +63,17 @@ let ctxRef: ExtensionContext | null = null;
 let apiRef: ExtensionAPI | null = null;
 
 /** dispatch 需要的环境快照 */
-const envOf = () => ({ connState, team: currentTeam, config: currentConfig });
+const envOf = () => ({
+  connState,
+  team: currentTeam,
+  config: currentConfig,
+  mode: currentMode,
+  // mesh/swim 需要报出监听端口,否则用户不知道拿什么当种子
+  listenPort: (transport as { port?: () => number | null } | null)?.port?.() ?? null,
+  // swim 模式的种子用的是边车 gossip 端口,和投递端口不是一个。
+  // 不报出来用户就无从写种子地址。
+  gossipPort: (transport as { gossipPort?: () => number | null } | null)?.gossipPort?.() ?? null,
+});
 
 // ---------------------------------------------------------------- 意图执行
 
@@ -212,12 +230,15 @@ function renderStatus() {
     return;
   }
   const icon = connState === "online" ? "🟢" : connState === "connecting" ? "🟡" : "🔴";
-  ui.setStatus("team", `${icon} team:${state.self || "?"} (${teamSize(state)})`);
+  ui.setStatus("team", `${icon} team:${state.self || "?"} (${teamSize(state)}) ${currentMode}`);
 }
 
 // ---------------------------------------------------------------- 连接
 
-function connectWith(team: string | null, config: { url: string; token: string; labels?: string[] }) {
+function connectWith(
+  team: string | null,
+  config: { url?: string; token: string; labels?: string[]; mode?: string; seeds?: string[] },
+) {
   transport?.stop();
 
   currentTeam = team;
@@ -229,7 +250,36 @@ function connectWith(team: string | null, config: { url: string; token: string; 
   state.members = [];
   state.pendingReply = null;
 
-  transport = createBrokerTransport({ url: toSocketUrl(config.url), token: config.token });
+  // 模式解析优先级:环境变量 > 配置 > 默认 broker
+  const resolved = resolveMode({ config });
+  if (!resolved.ok) {
+    ctxRef?.ui.notify(`team:${resolved.reason}`, "error");
+    return;
+  }
+  currentMode = resolved.mode;
+
+  const readiness = modeReadiness(resolved.mode, config);
+  if (!readiness.ready) {
+    ctxRef?.ui.notify(`team:${resolved.mode} 模式不可用 —— ${readiness.reason}`, "error");
+    return;
+  }
+
+  const made = createTransport({
+    mode: resolved.mode,
+    config,
+    listenHost: process.env.TEAM_LISTEN_HOST ?? "0.0.0.0",
+    listenPort: Number(process.env.TEAM_LISTEN_PORT ?? 0),
+    advertiseHost: process.env.TEAM_ADVERTISE_HOST ?? null,
+    sidecarPath: process.env.PI_TEAM_SWIM_SIDECAR ?? null,
+  });
+
+  if (!made.ok) {
+    ctxRef?.ui.notify(`team:${made.reason}`, "error");
+    return;
+  }
+
+  transport = made.transport;
+  if (made.warning) ctxRef?.ui.notify(`team:${made.warning}`, "warning");
 
   transport.on("state", (next, detail) => {
     connState = next as ConnState;
@@ -242,6 +292,14 @@ function connectWith(team: string | null, config: { url: string; token: string; 
     } else if (next === "offline" && (detail as { code?: number })?.code === CLOSE_REPLACED) {
       ctxRef?.ui.notify("team:连接被同名实例顶替", "warning");
     }
+    renderStatus();
+  });
+
+  // mesh 和 swim 通过 membership 事件推送成员表。
+  // broker 模式走控制消息,不会发这个事件 —— 所以两种都要接,
+  // 少了这一处,mesh/swim 下 roster 永远只有自己。
+  transport.on("membership", (list: unknown) => {
+    applyRoster(state, { members: list });
     renderStatus();
   });
 
@@ -298,7 +356,9 @@ export default function (pi: ExtensionAPI) {
   pi.registerFlag("team", { description: "启动时加入的 team 名", type: "string" });
   pi.registerFlag("team-name", { description: "本节点的名字", type: "string" });
   pi.registerFlag("team-labels", { description: "本节点的标签,逗号分隔", type: "string" });
-  pi.registerFlag("team-url", { description: "直接给 broker URL(不读 team 配置)", type: "string" });
+  pi.registerFlag("team-mode", { description: "投递模式:broker | mesh | swim", type: "string" });
+  pi.registerFlag("team-seeds", { description: "mesh/swim 的种子地址,逗号分隔", type: "string" });
+  pi.registerFlag("team-url", { description: "broker 模式的 URL(不读 team 配置)", type: "string" });
   pi.registerFlag("team-announce", { description: "自动回信模式:off | auto | always", type: "string" });
 
   // ---- 生命周期
@@ -321,10 +381,19 @@ export default function (pi: ExtensionAPI) {
     const team = (pi.getFlag("team") as string) ?? process.env.TEAM ?? "";
     const url = (pi.getFlag("team-url") as string) ?? process.env.TEAM_URL ?? "";
     const token = process.env.TEAM_TOKEN ?? "";
+    const modeFlag = (pi.getFlag("team-mode") as string) ?? process.env.TEAM_MODE ?? "";
+    const seedsFlag = (pi.getFlag("team-seeds") as string) ?? process.env.TEAM_SEEDS ?? "";
 
     if (team) {
       // joinTeam 只读本地配置 / 或记录新配置,不涉及网络
-      const r = joinTeam({ team, url: url || undefined, token: token || undefined, save: false });
+      const r = joinTeam({
+        team,
+        url: url || undefined,
+        token: token || undefined,
+        mode: modeFlag || undefined,
+        seeds: seedsFlag || undefined,
+        save: false,
+      });
       if (!r.ok) {
         ctx.ui.notify(`team:${r.reason}`, "error");
         return;
@@ -333,8 +402,15 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    if (url && token) {
-      connectWith(null, { url, token, labels: state.selfLabels });
+    // 不读配置文件,完全由参数/环境变量驱动(适合容器和脚本)
+    if (token && (url || seedsFlag || modeFlag)) {
+      connectWith(null, {
+        url: url || undefined,
+        token,
+        labels: state.selfLabels,
+        mode: modeFlag || undefined,
+        seeds: seedsFlag ? normalizeSeeds(seedsFlag) : undefined,
+      });
       return;
     }
 

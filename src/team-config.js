@@ -20,6 +20,8 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, wr
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { MODES } from "./mode.js";
+
 /** 名字必须和 broker 的校验一致,否则能写下来却连不上 */
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
 
@@ -70,7 +72,9 @@ export function readTeam(team, home = homedir()) {
   if (!existsSync(path)) return null;
   try {
     const data = JSON.parse(readFileSync(path, "utf8"));
-    if (!data || typeof data.url !== "string" || typeof data.token !== "string") return null;
+    if (!data || typeof data.token !== "string") return null;
+    // 旧配置没有 mode 字段 → 视为 broker(那是当时唯一的模式)
+    if (!data.mode) data.mode = "broker";
     return data;
   } catch {
     return null;
@@ -107,15 +111,26 @@ export function removeTeam(team, home = homedir()) {
  * 注意它**不启动任何东西**,也不验证 broker 是否可达 —— 创建是本地动作。
  * join 才负责连上。
  */
-export function createTeam({ team, url, token, labels = [], home = homedir() }) {
+export function createTeam({ team, url, token, labels = [], mode = "broker", seeds = [], home = homedir() }) {
   const t = validateTeamName(team);
   if (!t.ok) return { ok: false, reason: t.reason };
 
-  // 先规范化再校验。反过来的话 ws:// 会在校验那步被拒,
-  // 而用户只是写了个等价的写法(命令行和文档里两种都有人用)。
-  const normalized = typeof url === "string" ? normalizeUrl(url) : url;
-  if (typeof normalized !== "string" || !/^https?:\/\//.test(normalized)) {
-    return { ok: false, reason: "url 必须以 http:// 或 https:// 开头(ws:// 和 wss:// 也接受,会转换)" };
+  if (!MODES.includes(mode)) {
+    return { ok: false, reason: `mode 只能是 ${MODES.join(" / ")},实际 "${mode}"` };
+  }
+
+  // broker 模式必须有 url;mesh/swim 用 seeds,url 可以不填。
+  // 这放宽是必要的:多模式支持之前,url 是唯一入口,现在不是了。
+  let normalized = null;
+  if (url) {
+    // 先规范化再校验。反过来的话 ws:// 会在校验那步被拒,
+    // 而用户只是写了个等价的写法。
+    normalized = normalizeUrl(url);
+    if (typeof normalized !== "string" || !/^https?:\/\//.test(normalized)) {
+      return { ok: false, reason: "url 必须以 http:// 或 https:// 开头(ws:// 和 wss:// 也接受,会转换)" };
+    }
+  } else if (mode === "broker") {
+    return { ok: false, reason: "broker 模式需要 url(mesh/swim 用 seeds)" };
   }
   if (readTeam(team, home)) {
     return { ok: false, reason: `team "${team}" 已存在。用 /team join ${team} 加入,或先 /team leave ${team}` };
@@ -126,9 +141,14 @@ export function createTeam({ team, url, token, labels = [], home = homedir() }) 
   }
 
   const finalToken = token || generateToken();
-  // 不写空 labels —— 它会在读取时覆盖调用方的标签(空数组是 truthy)
-  const config = { url: normalized, token: finalToken, createdAt: new Date().toISOString() };
+  // 不写空字段 —— 空数组是 truthy,读回来会覆盖调用方给的值
+  const config = { mode, token: finalToken, createdAt: new Date().toISOString() };
+  if (normalized) config.url = normalized;
   if (labels?.length) config.labels = labels;
+  const cleanSeeds = (Array.isArray(seeds) ? seeds : String(seeds ?? "").split(","))
+    .map((s) => String(s).trim())
+    .filter(Boolean);
+  if (cleanSeeds.length) config.seeds = cleanSeeds;
   const path = writeTeam(team, config, home);
 
   return { ok: true, path, created: !token, token: finalToken, config };
@@ -140,25 +160,23 @@ export function createTeam({ team, url, token, labels = [], home = homedir() }) 
  * 找不到本地配置时,允许用 url + token 现场加入并记下来 —— 否则
  * 每台机器都要先手工建配置文件,那就不像"join"了。
  */
-export function joinTeam({ team, url, token, save = true, home = homedir() }) {
+export function joinTeam({ team, url, token, mode, seeds, save = true, home = homedir() }) {
   const t = validateTeamName(team);
   if (!t.ok) return { ok: false, reason: t.reason };
 
   const existing = readTeam(team, home);
 
-  if (!existing && !url) {
-    const known = listTeams(home);
-    return {
-      ok: false,
-      reason: known.length
-        ? `本地没有 team "${team}"。已有的:${known.join(", ")}`
-        : `本地没有 team "${team}",而且没给 url。用 /team join ${team} <url> <token>`,
-    };
-  }
-
   if (!existing) {
-    if (!token) return { ok: false, reason: "首次加入需要 token" };
-    const created = createTeam({ team, url, token, home });
+    if (!token) {
+      const known = listTeams(home);
+      return {
+        ok: false,
+        reason: known.length
+          ? `本地没有 team "${team}"。已有的:${known.join(", ")}`
+          : `本地没有 team "${team}",首次加入需要 token`,
+      };
+    }
+    const created = createTeam({ team, url, token, mode, seeds, home });
     if (!created.ok) return created;
     return { ok: true, config: created.config, path: created.path, adopted: true };
   }

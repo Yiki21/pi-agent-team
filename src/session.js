@@ -245,7 +245,8 @@ export function sendMessage(s, { to, text, hops = 0, re = null, origin = "user",
 
 function formatTarget(to) {
   if (Array.isArray(to)) return to.join(",");
-  return to === "*" ? "全员" : to === "@default" ? "默认组" : to.replace(/^@/, "#");
+  // 显示用规范写法 @,不转成 # —— 用户输入的是 @,回显成 # 会让人以为要改写法
+  return to === "*" ? "全员" : to === "@default" ? "默认组" : String(to).replace(/^#/, "@");
 }
 
 // ---------------------------------------------------------------- 入站

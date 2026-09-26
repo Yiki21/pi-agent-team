@@ -1,7 +1,7 @@
 {
   "name": "pi-agent-team",
   "version": "0.1.0",
-  "description": "Turn several machines running the Pi coding agent into one team that talks to itself over your tailnet. Broker + Pi extension + agent skill.",
+  "description": "Turn several machines running the Pi coding agent into one team over your tailnet. Three transports (broker / mesh / SWIM), one shared API and conformance suite.",
   "license": "MIT",
   "author": "Yiki21",
   "type": "module",
@@ -14,7 +14,10 @@
     "agent-team",
     "multi-agent",
     "tailscale",
-    "coding-agent"
+    "coding-agent",
+    "swim",
+    "memberlist",
+    "gossip"
   ],
   "engines": {
     "node": ">=22"
@@ -35,6 +38,9 @@
     "index.ts",
     "src/",
     "skills/",
+    "swim/main.go",
+    "swim/go.mod",
+    "swim/go.sum",
     "README.md",
     "LICENSE"
   ],
@@ -42,7 +48,8 @@
     "test": "node --test src/ e2e/",
     "test:unit": "node --test src/",
     "test:e2e": "node --test e2e/",
-    "broker": "node broker.mjs"
+    "broker": "node broker.mjs",
+    "build:sidecar": "cd swim && go build -o ../.tmp/swim-sidecar ."
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

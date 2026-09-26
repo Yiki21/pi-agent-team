@@ -125,16 +125,42 @@ export function dispatch(input, state, env) {
 
 function statusLines(state, env) {
   const cfg = env.config ?? (env.team ? readTeam(env.team) : null);
-  return [
-    `team       ${env.team ?? "(未加入)"}`,
+  const mode = env.mode ?? cfg?.mode ?? "broker";
+
+  const lines = [
+    // 这里说的是"本次连接属于哪个 team",和末尾"已存 team 列表"不是一回事。
+    // 措辞要区分开,否则用环境变量连接时会同时看到"未加入"和"已存 dev",
+    // 看起来自相矛盾(实测中确实被误读成一个 bug)。
+    `当前 team  ${env.team ?? "(未绑定,由环境变量直连)"}`,
     `节点名     ${state.self || "(未设置)"}`,
     `本机标签   ${state.selfLabels?.length ? state.selfLabels.join(", ") : "(无)"}`,
+    `模式       ${mode}`,
     `连接       ${env.connState}`,
-    `broker     ${cfg?.url ?? "(未配置)"}`,
+  ];
+
+  if (mode === "broker") {
+    lines.push(`broker     ${cfg?.url ?? "(未配置)"}`);
+  } else {
+    lines.push(`seeds      ${(cfg?.seeds ?? []).join(", ") || "(无,只能被动等待别人连你)"}`);
+    lines.push(`投递端口   ${env.listenPort ?? "(未就绪)"}`);
+
+    // 种子地址说的是哪个端口,取决于模式:
+    //   mesh  直接连对端的投递端口
+    //   swim  连对端的 gossip 端口,投递端口由成员信息带出来
+    if (mode === "swim") {
+      lines.push(`gossip 端口 ${env.gossipPort ?? "(未就绪)"}`);
+      if (env.gossipPort) lines.push(`种子写法   <本机可达地址>:${env.gossipPort}`);
+    } else if (env.listenPort) {
+      lines.push(`种子写法   <本机可达地址>:${env.listenPort}`);
+    }
+  }
+
+  lines.push(
     `在线       ${teamSize(state)} 个节点(${othersOf(state).length} 个其他节点)`,
     `自动回信   ${state.announce}`,
-    `本机 team  ${listTeams().join(", ") || "(无)"}`,
-  ];
+    `已存 team  ${listTeams().join(", ") || "(无)"}`,
+  );
+  return lines;
 }
 
 function peersResult(state) {
@@ -294,7 +320,7 @@ function formatTarget(to) {
   if (Array.isArray(to)) return to.join(",");
   if (to === "*") return "全员";
   if (to === "@default") return "默认组";
-  return String(to).replace(/^@/, "#");
+  return String(to).replace(/^#/, "@");
 }
 
 // ---------------------------------------------------------------- announce
