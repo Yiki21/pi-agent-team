@@ -93,7 +93,7 @@ test("send:单播产出 send + card 两个意图", () => {
   assert.equal(r.ok, true);
   assert.deepEqual(intentTypes(r), ["send", "card"]);
   assert.deepEqual(r.intentions[0].to, "peer");
-  assert.equal(r.intentions[0].body.text, "你好");
+  assert.equal(r.intentions[0].text, "你好", "正文在顶层,由 index.ts 组装 body");
   assert.equal(r.intentions[1].kind, "send");
 });
 
@@ -109,7 +109,7 @@ test("send:记录 origin=user,供对方回复时判断", () => {
 test("send:多词内容拼成一条", () => {
   const c = setup();
   const r = run("send", ["peer", "帮我", "跑一下", "测试"], c);
-  assert.equal(r.intentions[0].body.text, "帮我 跑一下 测试");
+  assert.equal(r.intentions[0].text, "帮我 跑一下 测试");
 });
 
 test("send:缺收件人或内容时拒绝,并给用法", () => {
@@ -301,7 +301,7 @@ test("双入口一致性:命令和工具走同一个 dispatch,输出必然相同
 
   assert.equal(viaCommand.ok, viaTool.ok);
   assert.deepEqual(intentTypes(viaCommand), intentTypes(viaTool));
-  assert.deepEqual(viaCommand.intentions[0].body, viaTool.intentions[0].body);
+  assert.deepEqual(viaCommand.intentions[0].text, viaTool.intentions[0].text);
   assert.deepEqual(viaCommand.intentions[0].to, viaTool.intentions[0].to);
 });
 
@@ -310,4 +310,123 @@ test("sendMessage 是 dispatch 与工具共用的底层入口", () => {
   const r = sendMessage("peer", "底层入口", "model", c.state, c.env);
   assert.equal(r.ok, true);
   assert.equal(c.state.outbound.get(r.intentions[0].id).origin, "model");
+});
+
+// ---------------------------------------------------------------- id 唯一性
+
+/**
+ * 真机上出过一次严重故障:id 生成器是 `m-<时间>-<进程内计数器>`,
+ * 缺了进程标识。两个节点在同一毫秒各发一条时,时间相同、计数器都从
+ * 0 开始,id 必然碰撞。接收方靠 id 去重,于是第二条被当成重复投递
+ * 静默丢弃。症状是"发送方看到投递 1/1,接收方毫无反应",极难定位。
+ */
+test("id 唯一性:同一毫秒内多次调用不重复", () => {
+  const c = setup();
+  const ids = new Set();
+  for (let i = 0; i < 50; i++) {
+    const r = run("send", ["peer", `m${i}`], c);
+    ids.add(r.intentions[0].id);
+  }
+  assert.equal(ids.size, 50, "同一毫秒内的 id 必须互不相同");
+});
+
+test("id 唯一性:带进程标识,不会和另一个进程碰撞", () => {
+  // 无法在单进程内直接模拟两个进程,但可以断言 id 里除了时间和
+  // 计数器之外还有一段进程级随机成分:长度足够且不随调用变化。
+  const c = setup();
+  const r = run("send", ["peer", "x"], c);
+  const id = r.intentions[0].id;
+
+  const parts = id.split("-");
+  assert.ok(parts.length >= 4, `id 应有 >=4 段(含进程标识),实际 ${id}`);
+
+  // 进程标识段在多次调用间保持不变(它是模块级的,不是每次随机)
+  const r2 = run("send", ["peer", "y"], c);
+  assert.equal(id.split("-")[2], r2.intentions[0].id.split("-")[2], "进程标识应稳定");
+});
+
+test("id 唯一性:群发路径也用同一个生成器", () => {
+  // 注意阈值:超过 BULK_WARN_THRESHOLD 会返回 confirmBulk 而不是
+  // 直接发送,所以群发要控制在阈值以内才能真正拿到 send 意图。
+  const peers = Array.from({ length: BULK_WARN_THRESHOLD }, (_, i) => member(`p${i}`, { labels: ["web"] }));
+  const bulk = setup({ peers });
+  const single = setup();
+
+  const fromBulk = run("send", ["@web", "b"], bulk);
+  assert.equal(fromBulk.ok, true);
+  assert.equal(fromBulk.party, undefined, "阈值以内应直接发送");
+
+  const bulkId = fromBulk.intentions[0].id;
+  const singleId = run("send", ["peer", "a"], single).intentions[0].id;
+
+  assert.match(bulkId, /^m-/);
+  assert.match(singleId, /^m-/);
+  assert.notEqual(bulkId, singleId);
+  assert.ok(bulkId.split("-").length >= 4, "群发路径的 id 也要带进程标识");
+  assert.equal(bulkId.split("-")[2], singleId.split("-")[2], "同一进程内进程标识应一致");
+});
+
+// ---------------------------------------------------------------- 意图契约
+
+/**
+ * send 意图必须用顶层 text / hops,由 index.ts 组装信封的 body。
+ *
+ * 真机上出过:dispatch.js 写 body:{text},而 index.ts 读 it.text,
+ * 结果 /team send 发出空正文的消息。对方只看到空字符串,
+ * 症状是"发送方显示投递成功,接收方完全没反应"。
+ *
+ * 两个生产者(dispatch.js 和 session.js)都要满足同一契约,
+ * 所以这里两边都测。
+ */
+test("契约:dispatch 的 send 意图用顶层 text / hops", () => {
+  const c = setup();
+  const r = run("send", ["peer", "正文内容"], c);
+  const send = r.intentions.find((i) => i.type === "send");
+
+  assert.ok(send);
+  assert.equal(send.text, "正文内容", "text 必须在顶层");
+  assert.equal(send.hops, 0);
+  assert.equal("body" in send, false, "不该自带 body —— 那是 index.ts 的职责");
+  assert.ok(send.id, "必须自带 id");
+});
+
+test("契约:群发确认后走 doSend,同样用顶层 text", () => {
+  const c = setup();
+  const r = doSend("peer", "群发正文", "user", { targets: ["peer"], unknown: [] }, c.state, c.env);
+  const send = r.intentions.find((i) => i.type === "send");
+
+  assert.ok(send);
+  assert.equal(send.text, "群发正文");
+  assert.equal("body" in send, false);
+});
+
+test("契约:两个生产者的 send 意图字段集一致", async () => {
+  // 防止再次出现"一边改了一边没改"
+  const { createSessionState, applyRoster, onTurnSettled } = await import("./session.js");
+
+  const c = setup();
+  const fromDispatch = run("send", ["peer", "x"], c).intentions.find((i) => i.type === "send");
+
+  const s = createSessionState("me");
+  applyRoster(s, { members: [{ name: "me", labels: [], host: null, addr: null, since: 0 }, { name: "peer", labels: [], host: null, addr: null, since: 0 }] });
+  s.pendingReply = { to: "peer", hops: 0, re: "r1" };
+  s.lastText = "y";
+  const fromSession = onTurnSettled(s).find((i) => i.type === "send");
+
+  const keys = (o) => Object.keys(o).sort().join(",");
+  assert.equal(
+    keys(fromDispatch).includes("text") && keys(fromSession).includes("text"),
+    true,
+    `两边都要有 text: dispatch=${keys(fromDispatch)} session=${keys(fromSession)}`,
+  );
+  assert.equal("body" in fromDispatch, false);
+  assert.equal("body" in fromSession, false);
+});
+
+test("契约:正文非空 —— 空正文会被接收方丢弃", () => {
+  const c = setup();
+  const r = run("send", ["peer", "非空"], c);
+  const send = r.intentions.find((i) => i.type === "send");
+  assert.ok(send, `应有 send 意图,实际 ${JSON.stringify(r)}`);
+  assert.ok(send.text.length > 0);
 });

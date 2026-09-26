@@ -105,11 +105,27 @@ export function knownLabels(s) {
  * 同时接受新格式(members,带元数据)和旧格式(peers,只有名字数组),
  * 因为 broker 可能先于扩展升级。
  */
+/**
+ * 应用 broker 推来的成员快照。
+ *
+ * 同时接受新格式(members,带元数据)和旧格式(peers,只有名字数组),
+ * 因为 broker 可能先于扩展升级。
+ *
+ * 字段名映射:broker 的 wire 字段是 `tags`(历史遗留),而扩展内部和
+ * 用户面向的词汇是 `labels`。这个接缝在这里收,上层看到的永远是 labels。
+ * 曾经因为没收这个接缝,标签在成员列表里静默丢失过。
+ */
 export function applyRoster(s, body) {
   /** @type {Member[]} */
   let list;
   if (Array.isArray(body?.members)) {
-    list = body.members;
+    list = body.members.map((m) => ({
+      name: m.name,
+      host: m.host ?? null,
+      addr: m.addr ?? null,
+      labels: m.labels ?? m.tags ?? [], // 兼容两种字段名
+      since: m.since ?? 0,
+    }));
   } else if (Array.isArray(body?.peers)) {
     list = body.peers.map((name) => ({ name, host: null, addr: null, labels: [], since: 0 }));
   } else {

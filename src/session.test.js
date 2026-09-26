@@ -403,3 +403,108 @@ test("出站记录有上限,不无限增长", () => {
   for (let i = 0; i < 1200; i++) sendMessage(s, { to: "peer", text: `m${i}`, origin: "model" });
   assert.ok(s.outbound.size <= 1000, `outbound 应被限制,实际 ${s.outbound.size}`);
 });
+
+// ---------------------------------------------------------------- 字段名接缝
+
+test("roster:broker 的 tags 字段映射成 labels", () => {
+  // 这是真机上踩过的坑:broker 发 tags,扩展读 labels,标签静默丢失。
+  // 上层只看 labels,接缝在 applyRoster 收。
+  const s = createSessionState("me");
+  applyRoster(s, {
+    members: [
+      { name: "me", host: null, addr: null, labels: ["x"], since: 0 },
+      { name: "peer", host: "dev01", addr: "1.2.3.4", tags: ["web", "fe"], since: 0 },
+    ],
+  });
+
+  const p = others(s)[0];
+  assert.deepEqual(p.labels, ["web", "fe"], "tags 应被映射成 labels");
+  assert.equal(p.host, "dev01");
+});
+
+test("roster:同时有 labels 和 tags 时优先 labels", () => {
+  const s = createSessionState("me");
+  applyRoster(s, { members: [{ name: "peer", labels: ["new"], tags: ["old"], host: null, addr: null, since: 0 }] });
+  assert.deepEqual(others(s)[0].labels, ["new"]);
+});
+
+test("roster:两者都缺时 labels 为空数组,不是 undefined", () => {
+  const s = createSessionState("me");
+  applyRoster(s, { members: [{ name: "peer", host: null, addr: null, since: 0 }] });
+  assert.deepEqual(others(s)[0].labels, []);
+});
+
+test("@label 群发能命中经 tags 映射来的节点", () => {
+  const s = createSessionState("me");
+  applyRoster(s, {
+    members: [
+      { name: "me", labels: [], host: null, addr: null, since: 0 },
+      { name: "a", tags: ["web"], host: null, addr: null, since: 0 },
+      { name: "b", tags: ["web"], host: null, addr: null, since: 0 },
+      { name: "c", tags: ["db"], host: null, addr: null, since: 0 },
+    ],
+  });
+  assert.deepEqual(resolveLocal(s, "@web").targets.sort(), ["a", "b"]);
+  assert.deepEqual(knownLabels(s), ["db", "web"]);
+});
+
+// ---------------------------------------------------------------- 意图契约
+
+/**
+ * send 意图的字段契约。
+ *
+ * 真机上出过一次:session.js 产出 { text },而 index.ts 读 { body },
+ * 于是自动回信发出一个没有 body 的信封,broker 判为"畸形信封"直接丢弃。
+ * 症状是"对方明明回信了但我收不到",很难从现象反推。
+ *
+ * 这组测试把契约钉在生产者一侧:send 意图必须在顶层带 text 和 hops。
+ */
+test("契约:onTurnSettled 的 send 意图在顶层带 text 和 hops", () => {
+  const s = session("me", [member("peer")]);
+  s.pendingReply = { to: "peer", hops: 0, re: "req-1" };
+  s.lastText = "回复内容";
+
+  const [send] = onTurnSettled(s);
+  assert.equal(send.type, "send");
+  assert.equal(send.text, "回复内容", "text 必须在顶层 —— index.ts 靠它组装 body");
+  assert.equal(typeof send.hops, "number");
+  assert.equal(send.hops, 1);
+  assert.equal(send.re, "req-1");
+  assert.equal(send.id, undefined === send.id ? undefined : send.id, "id 由生产者生成");
+  assert.ok(send.id, "send 意图必须自带 id");
+});
+
+test("契约:announce=always 的 send 意图同样带 text / hops / fyi", () => {
+  const s = session("me", [member("a")], { announce: "always", lastText: "广播内容" });
+  const [send] = onTurnSettled(s);
+
+  assert.equal(send.type, "send");
+  assert.equal(send.text, "广播内容");
+  assert.equal(send.hops, 1);
+  assert.equal(send.fyi, true);
+  assert.ok(send.id);
+});
+
+test("契约:sendMessage 的 send 意图带 text / hops / id", () => {
+  const s = session("me", [member("peer")]);
+  const actions = sendMessage(s, { to: "peer", text: "手动发出", origin: "user" });
+  const send = actions.find((a) => a.type === "send");
+
+  assert.ok(send);
+  assert.equal(send.text, "手动发出");
+  assert.equal(send.hops, 0);
+  assert.ok(send.id);
+  assert.equal(send.re, null);
+});
+
+test("契约:所有 send 意图都不使用 body 字段(由调用方组装)", () => {
+  const s = session("me", [member("peer")]);
+  s.lastText = "x";
+
+  const fromSettled = onTurnSettled({ ...s, pendingReply: { to: "peer", hops: 0, re: "r" } });
+  const fromSend = sendMessage(s, { to: "peer", text: "y", origin: "user" });
+
+  for (const a of [...fromSettled, ...fromSend].filter((x) => x.type === "send")) {
+    assert.equal("body" in a, false, "send 意图不该自带 body —— 那是 index.ts 的职责");
+  }
+});

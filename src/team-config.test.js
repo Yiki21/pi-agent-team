@@ -6,7 +6,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -225,4 +225,39 @@ test("write:能收紧已存在文件的权限", (t) => {
 
   writeTeam("alpha", { url: URL_OK, token: generateToken() }, home);
   assert.equal(statSync(file).mode & 0o777, 0o600, "写入时应重新 chmod 收紧权限");
+});
+
+// ---------------------------------------------------------------- 标签与空数组
+
+test("create:不给 labels 时不写入该字段(空数组会覆盖调用方的标签)", (t) => {
+  const home = withHome(t);
+  createTeam({ team: "alpha", url: URL_OK, home });
+  const cfg = readTeam("alpha", home);
+  assert.equal("labels" in cfg, false, "不该留一个空 labels 字段在配置里");
+});
+
+test("create:给了 labels 时写进配置", (t) => {
+  const home = withHome(t);
+  createTeam({ team: "alpha", url: URL_OK, labels: ["web", "fe"], home });
+  assert.deepEqual(readTeam("alpha", home).labels, ["web", "fe"]);
+});
+
+test("create:空 labels 数组等同于不给", (t) => {
+  const home = withHome(t);
+  createTeam({ team: "alpha", url: URL_OK, labels: [], home });
+  assert.equal("labels" in readTeam("alpha", home), false);
+});
+
+test("read:旧配置里的空 labels 字段仍然可读", (t) => {
+  const home = withHome(t);
+  createTeam({ team: "alpha", url: URL_OK, home });
+  // 模拟早期版本写下的 labels: []
+  const file = join(configDir(home), "alpha.json");
+  const data = JSON.parse(readFileSync(file, "utf8"));
+  data.labels = [];
+  writeFileSync(file, JSON.stringify(data));
+
+  const cfg = readTeam("alpha", home);
+  assert.ok(cfg, "不该因为空 labels 就判定配置无效");
+  assert.deepEqual(cfg.labels, []);
 });

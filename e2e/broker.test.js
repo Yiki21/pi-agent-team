@@ -18,14 +18,34 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const BROKER = join(HERE, "..", "broker.mjs");
 const TOKEN = "test-token-do-not-use-in-production";
 
-let nextPort = 19000 + (process.pid % 500);
-const allocPort = () => nextPort++;
+import { createServer } from "node:net";
+
+/**
+ * 要一个空闲端口。
+ *
+ * 之前是 `19000 + (pid % 500)`,在多个测试文件并行时(各自一个
+ * Node 进程)会碰撞,表现为随机的"welcome 超时"。让内核分配
+ * 才是可靠的:先监听 0,读出端口,然后释放。
+ *
+ * 这里有 TOCTOU 窗口(释放到 broker 绑定之间),但窗口极小,
+ * 而且比基于 pid 的确定性碰撞好得多。
+ */
+function allocPort() {
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.on("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
 
 /**
  * 起一个隔离的 broker,返回一个带 connect/close 的测试上下文。
  */
 async function withBroker(t, { noTakeover = false, heartbeat = 2000 } = {}) {
-  const port = allocPort();
+  const port = await allocPort();
   const base = `ws://127.0.0.1:${port}`;
   const sockets = [];
 
@@ -468,4 +488,53 @@ test("群发:#tag 不把自己算进去(发送者也属于该组时)", async (t)
 
   const ack = await waitFor(() => me.inbox.find((m) => m.re === "self-1"));
   assert.equal(ack.body.total, 1, "总数应排除发送者自己");
+});
+
+test("群发:@label 语法(和客户端的用户面向写法一致)", async (t) => {
+  const { connect } = await withBroker(t);
+  const lead = await connect("lead");
+  const w1 = await connect("web1", { tags: "web" });
+  const db = await connect("db1", { tags: "db" });
+  await waitFor(() => lead.inbox.filter((m) => m.body?.kind === "peer_joined").length >= 2);
+
+  lead.ws.send(JSON.stringify({ from: "lead", to: "@web", id: "at-1", re: null, body: { text: "x" } }));
+
+  assert.ok(await waitFor(() => w1.inbox.find((m) => m.id === "at-1")), "@web 应命中 web1");
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(db.inbox.find((m) => m.id === "at-1"), undefined, "db1 不该收到");
+
+  const ack = await waitFor(() => lead.inbox.find((m) => m.re === "at-1"));
+  assert.equal(ack.body.kind, "delivered", "不该报 unknown —— 两侧语法必须一致");
+  assert.equal(ack.body.delivered, 1);
+});
+
+test("群发:@default 指全员", async (t) => {
+  const { connect } = await withBroker(t);
+  const lead = await connect("lead");
+  const a = await connect("a");
+  const b = await connect("b");
+  await waitFor(() => lead.inbox.filter((m) => m.body?.kind === "peer_joined").length >= 2);
+
+  lead.ws.send(JSON.stringify({ from: "lead", to: "@default", id: "def-1", re: null, body: { text: "x" } }));
+
+  assert.ok(await waitFor(() => a.inbox.find((m) => m.id === "def-1")));
+  assert.ok(await waitFor(() => b.inbox.find((m) => m.id === "def-1")));
+  assert.equal(lead.inbox.find((m) => m.id === "def-1"), undefined, "发送者不该收到");
+
+  const ack = await waitFor(() => lead.inbox.find((m) => m.re === "def-1"));
+  assert.equal(ack.body.delivered, 2);
+});
+
+test("群发:@default 不被当成 label default", async (t) => {
+  const { connect } = await withBroker(t);
+  const lead = await connect("lead");
+  // 故意造一个真叫 default 的 tag,确认 @default 走全员而不是这个组
+  const named = await connect("marker", { tags: "default" });
+  const plain = await connect("plain");
+  await waitFor(() => lead.inbox.filter((m) => m.body?.kind === "peer_joined").length >= 2);
+
+  lead.ws.send(JSON.stringify({ from: "lead", to: "@default", id: "amb-1", re: null, body: { text: "x" } }));
+
+  assert.ok(await waitFor(() => named.inbox.find((m) => m.id === "amb-1")));
+  assert.ok(await waitFor(() => plain.inbox.find((m) => m.id === "amb-1")), "全员应包含没有该 tag 的节点");
 });

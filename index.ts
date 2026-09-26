@@ -90,11 +90,18 @@ async function runIntentions(
         break;
 
       case "send": {
+        // 契约:send 意图用顶层 text / hops / to / id / re。
+        // 之前的 bug 是 index.ts 读 it.body 而 session.js 给 it.text,
+        // 于是自动回信发出一个没有 body 的信封,被 broker 判为畸形。
         const okSent = transport?.send({
           to: it.to as string | string[],
           id: String(it.id),
           re: (it.re as string | null) ?? null,
-          body: it.body as Record<string, unknown>,
+          body: {
+            text: String(it.text ?? ""),
+            hops: typeof it.hops === "number" ? it.hops : 1,
+            ...(it.fyi ? { fyi: true } : {}),
+          },
         });
         if (!okSent) {
           const msg = "team:未连接,消息没发出去";
@@ -215,7 +222,10 @@ function connectWith(team: string | null, config: { url: string; token: string; 
 
   currentTeam = team;
   currentConfig = config;
-  if (config.labels) state.selfLabels = config.labels;
+  // 只在配置真的带了非空标签时才用它。
+  // 空数组是 truthy —— 直接赋值会把命令行 --team-labels 覆盖成空,
+  // 而 createTeam 写配置时恰好会留下 labels: []。
+  if (config.labels?.length) state.selfLabels = config.labels;
   state.members = [];
   state.pendingReply = null;
 

@@ -176,7 +176,18 @@ function resolveTargets(to, senderName) {
       continue;
     }
 
-    if (t.startsWith("#")) {
+    // 默认组:不指定收件人时等同于全员。这里的语义和客户端的
+    // parseRecipients 必须一致,否则"默认组"在不同层指向不同集合。
+    // 必须在下面的 @ 分支之前判,否则 @default 会被当成 label "default"。
+    if (t === "@default" || t === "default") {
+      for (const name of peers.keys()) if (name !== senderName) targets.add(name);
+      continue;
+    }
+
+    if (t.startsWith("#") || t.startsWith("@")) {
+      // 两种前缀都认:# 是早期语法,@ 是现在的用户面向语法。
+      // 只认一种会让客户端"本地算出命中 1 个"但 broker 报 unknown ——
+      // 两侧语法不同步时的典型症状。
       const tag = t.slice(1);
       let matched = 0;
       for (const p of peers.values()) {

@@ -53,8 +53,22 @@ const ok = (lines, extra = {}) => ({ ok: true, lines, intentions: [], ...extra }
 // 要么就漏掉,两种都容易出错。
 const bad = (error) => ({ ok: false, lines: [], intentions: [], error });
 
+/**
+ * 消息 id 生成。
+ *
+ * 必须全 cluster 唯一。早期版本是 `m-<时间>-<进程内计数器>`,
+ * 缺了进程标识 —— 两个节点在同一毫秒各发一条时,时间相同、计数
+ * 器都从 0 开始,id 必然碰撞。接收方靠 id 去重,于是第二条被当成
+ * 重复投递静默丢弃。
+ *
+ * 症状极难定位:发送方看到"投递 1/1",接收方毫无反应。
+ *
+ * 组成:时间(可排序)+ 进程级随机数(跨进程不重复)+ 进程内计数器
+ * (同毫秒内不重复)。
+ */
+const PROC_TAG = Math.random().toString(36).slice(2, 8);
 let idSeq = 0;
-const newId = () => `m-${Date.now().toString(36)}-${(idSeq++).toString(36)}`;
+const newId = () => `m-${Date.now().toString(36)}-${PROC_TAG}-${(idSeq++).toString(36)}`;
 
 /**
  * 主分发。
@@ -266,7 +280,11 @@ export function doSend(to, text, origin, local, state, env) {
 
   return ok([`已发给 ${formatTarget(to)}(${local.targets.length} 个节点)`], {
     intentions: [
-      { type: "send", to, id, re: null, body: { text, hops: 0 } },
+      // 契约(与 session.js 一致):send 意图用**顶层** text / hops,
+      // 由 index.ts 组装成信封的 body。
+      // 曾经一边写 body:{text} 一边读 it.text,导致 /team send 发出
+      // 空正文的消息 —— 对方只看到空字符串,症状是"投递成功但对方没反应"。
+      { type: "send", to, id, re: null, text, hops: 0 },
       { type: "card", kind: "send", peer: formatTarget(to), text },
     ],
   });

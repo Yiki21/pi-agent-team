@@ -126,7 +126,9 @@ export function createTeam({ team, url, token, labels = [], home = homedir() }) 
   }
 
   const finalToken = token || generateToken();
-  const config = { url: normalized, token: finalToken, labels, createdAt: new Date().toISOString() };
+  // 不写空 labels —— 它会在读取时覆盖调用方的标签(空数组是 truthy)
+  const config = { url: normalized, token: finalToken, createdAt: new Date().toISOString() };
+  if (labels?.length) config.labels = labels;
   const path = writeTeam(team, config, home);
 
   return { ok: true, path, created: !token, token: finalToken, config };
