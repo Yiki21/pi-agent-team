@@ -36,7 +36,8 @@ const OUTBOUND_CAP = 1000;
  * @typedef {{ name: string, host: string|null, addr: string|null, labels: string[], since: number }} Member
  * @typedef {{ text: string, origin: "user"|"model", to: string|string[] }} Outbound
  * @typedef {{ seen: Set<string>, injected: Set<string>, outbound: Map<string, Outbound>,
- *             members: Member[], self: string, announce: "off"|"auto"|"always",
+ *             members: Member[], self: string, selfLabels: string[],
+ *             announce: "off"|"auto"|"always",
  *             pendingReply: { to: string, hops: number, re: string }|null,
  *             lastText: string }} SessionState
  *
@@ -58,6 +59,8 @@ export function createSessionState(self = "") {
     outbound: new Map(),
     members: [],
     self,
+    /** 本节点自己的标签。broker 需要它来解析 @label 群发。 */
+    selfLabels: [],
     announce: "auto",
     pendingReply: null,
     lastText: "",
