@@ -158,7 +158,9 @@ function knownTags(): string[] {
 function render() {
   const ui = ctxRef?.ui;
   if (!ui) return;
-  const size = members.length > 0 ? members.length : 1;
+  // 团队规模 = 其他成员 + 自己。旧写法独自在线时显示 1,
+  // 有别人时却只数别人 —— 3 个节点的团队显示成 (2)。
+  const size = members.length + 1;
   const icon = status === "online" ? "🟢" : status === "connecting" ? "🟡" : "🔴";
   ui.setStatus("team", `${icon} team:${self} (${size})`);
 }

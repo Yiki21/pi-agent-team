@@ -452,3 +452,20 @@ test("成员元数据:非法 tag 被丢弃,数量有上限", async (t) => {
   assert.ok(!tagger.tags.includes("bad tag!"), "含空格/感叹号的 tag 应被丢弃");
   assert.ok(tagger.tags.length <= 8, `tag 数量应有上限,实际 ${tagger.tags.length}`);
 });
+
+test("群发:#tag 不把自己算进去(发送者也属于该组时)", async (t) => {
+  const { connect } = await withBroker(t);
+  // 发送者自己就是 web —— 在线两个 web 节点,但它只应发给另一个
+  const me = await connect("web-sender", { tags: "web" });
+  const peer = await connect("web-other", { tags: "web" });
+  await waitFor(() => me.inbox.some((m) => m.body?.kind === "peer_joined"));
+
+  me.ws.send(JSON.stringify({ from: "web-sender", to: "#web", id: "self-1", re: null, body: { text: "x" } }));
+
+  assert.ok(await waitFor(() => peer.inbox.find((m) => m.id === "self-1")), "同组其他节点应收到");
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(me.inbox.find((m) => m.id === "self-1"), undefined, "发送者不应收到自己发的");
+
+  const ack = await waitFor(() => me.inbox.find((m) => m.re === "self-1"));
+  assert.equal(ack.body.total, 1, "总数应排除发送者自己");
+});
