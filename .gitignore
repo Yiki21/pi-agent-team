@@ -1,0 +1,25 @@
+# 依赖
+node_modules/
+
+# 测试与调试残留(按 AGENTS.md 约定,项目临时文件放 .tmp)
+.tmp/
+*.jsonl
+*.log
+
+# 凭据 —— 绝不入库
+.env
+.env.*
+!.env.example
+*token*
+!src/**/token*.js
+!src/**/token*.ts
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# 构建产物
+dist/
+*.tgz
