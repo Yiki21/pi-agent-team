@@ -23,3 +23,7 @@ node_modules/
 # 构建产物
 dist/
 *.tgz
+
+# Go:边车构建产物与模块缓存
+/swim/swim-sidecar
+/swim/swim-sidecar.exe

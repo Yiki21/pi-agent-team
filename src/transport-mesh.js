@@ -96,6 +96,15 @@ export function createMeshTransport({
   advertiseHost = null,
   heartbeatMs = HEARTBEAT_MS,
   helloTimeoutMs = HELLO_TIMEOUT_MS,
+  /**
+   * 由外部提供成员来源时置 true。
+   *
+   * SWIM 模式用它:成员表由 Go 边车(memberlist)负责,mesh 只提供
+   * 连接与投递。此时 mesh 自己**不**做成员发现也不扩散 hello,
+   * 成员视图完全由外部注入 —— 否则两套发现机制会互相干扰,
+   * 表现为成员表里出现边车已经判死的节点。
+   */
+  externalMembership = false,
 } = {}) {
   const bus = createEmitter();
 
@@ -137,7 +146,11 @@ export function createMeshTransport({
     return out;
   }
 
-  const emitMembership = () => bus.emit("membership", members());
+  /** 外部注入的成员(仅 externalMembership 模式使用) */
+  let injectedMembers = [];
+
+  const emitMembership = () =>
+    bus.emit("membership", externalMembership ? injectedMembers : members());
 
   /** hello 载荷:自己 + 完整成员表(含地址,便于对端回连) */
   function helloBody() {
@@ -597,8 +610,60 @@ export function createMeshTransport({
     },
 
     state: () => state,
-    members,
+    // 外部提供成员时,members() 返回注入的视图 —— 它才是权威的
+    members: () => (externalMembership ? injectedMembers : members()),
     on: bus.on,
     port: () => boundPort,
+
+    /**
+     * 外部成员来源注入(仅 externalMembership 模式)。
+     *
+     * 两条信息都要:成员名单,以及每个成员的投递端点。
+     * 端点告诉 mesh 该往哪连;没有端点的成员无法投递。
+     *
+     * 注意这里会**主动建边**,不等 send 时才建。原因:SWIM 模式下
+     * mesh 不做成员发现,所以两边都不会主动连对方 —— 如果只在
+     * send 时按需建边,那条边第一次发消息时还在握手,消息就丢了
+     * (或要等排队)。提前建边让首次发送就能成功。
+     */
+    setExternalMembers(list) {
+      if (!externalMembership) return;
+      injectedMembers = Array.isArray(list) ? list : [];
+
+      const wanted = new Set();
+
+      for (const m of injectedMembers) {
+        if (!m?.name || m.name === self?.name) continue;
+        wanted.add(m.name);
+
+        const port = m.deliver ?? (m.endpoints?.[0] ? Number(String(m.endpoints[0]).split(":").pop()) : null);
+        const addr = m.addr ?? null;
+        if (!addr || !port) continue;
+
+        const cur = endpoints.get(m.name);
+        if (!cur || cur.addr !== addr || cur.port !== port) {
+          endpoints.set(m.name, { addr, port });
+        }
+      }
+
+      // 已经不在成员表里的边要拆掉 —— 否则 SWIM 判死的节点仍然
+      // 占着一条重连中的边,我们会反复尝试连一个死节点。
+      for (const [key, link] of peers) {
+        const name = link.name;
+        if (name.startsWith("seed:")) continue;
+        if (!wanted.has(name) && name !== self?.name) {
+          try {
+            link.stop();
+          } catch {}
+          peers.delete(key);
+          endpoints.delete(name);
+        }
+      }
+
+      // 为每个成员确保有边(提前握手,首次发送即命中)
+      for (const name of wanted) ensureLink(name);
+
+      emitMembership();
+    },
   };
 }
