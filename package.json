@@ -36,18 +36,26 @@
   "files": [
     "broker.mjs",
     "index.ts",
-    "src/",
     "skills/",
     "swim/main.go",
     "swim/go.mod",
     "swim/go.sum",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "src/dispatch.js",
+    "src/mode.js",
+    "src/options.js",
+    "src/session.js",
+    "src/team-config.js",
+    "src/transport-mesh.js",
+    "src/transport-swim.js",
+    "src/transport.js",
+    "src/ws.js"
   ],
   "scripts": {
-    "test": "node --test src/ e2e/",
-    "test:unit": "node --test src/",
-    "test:e2e": "node --test e2e/",
+    "test": "node --test --test-timeout=30000 src/ e2e/",
+    "test:unit": "node --test --test-timeout=30000 src/",
+    "test:e2e": "node --test --test-timeout=30000 e2e/",
     "broker": "node broker.mjs",
     "build:sidecar": "cd swim && go build -o ../.tmp/swim-sidecar ."
   },

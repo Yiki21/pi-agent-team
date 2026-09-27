@@ -38,7 +38,15 @@ function findSidecar(explicit) {
   if (process.env.PI_TEAM_SWIM_SIDECAR) {
     return existsSync(process.env.PI_TEAM_SWIM_SIDECAR) ? process.env.PI_TEAM_SWIM_SIDECAR : null;
   }
-  for (const p of [join(HERE, "..", ".tmp", "swim-sidecar"), join(HERE, "..", "swim", "swim-sidecar")]) {
+  // 三个位置,按"越可能是用户手建的越靠前"排列:
+  //   swim/swim-sidecar  按 README 构建的产物(装成包时就在这儿)
+  //   .tmp/swim-sidecar  仓库内开发时的构建产物
+  //   ../swim-sidecar    包根目录下的构建产物
+  for (const p of [
+    join(HERE, "..", "swim", "swim-sidecar"),
+    join(HERE, "..", ".tmp", "swim-sidecar"),
+    join(HERE, "..", "swim-sidecar"),
+  ]) {
     if (existsSync(p)) return p;
   }
   return null;
@@ -91,8 +99,8 @@ export function createSwimTransport({
       setState("offline", {
         reason: "sidecar_missing",
         message:
-          "找不到 SWIM 边车。构建:cd swim && go build -o ../.tmp/swim-sidecar . " +
-          "或用 PI_TEAM_SWIM_SIDECAR 指定路径。",
+          "找不到 SWIM 边车。构建:进入包的 swim/ 目录执行 go build -o ../swim-sidecar . ," +
+          "或用 PI_TEAM_SWIM_SIDECAR 指到构建产物。",
       });
       return false;
     }

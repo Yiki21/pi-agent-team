@@ -181,9 +181,26 @@ export function joinTeam({ team, url, token, mode, seeds, save = true, home = ho
     return { ok: true, config: created.config, path: created.path, adopted: true };
   }
 
-  // 已有配置又被显式给了 url/token:更新它
-  if (url || token) {
-    const config = { ...existing, url: url ? normalizeUrl(url) : existing.url, token: token ?? existing.token };
+  // 已有配置又被显式给了选项:更新它。
+  //
+  // mode/seeds 也要能改 —— 否则想把 team 从 broker 换成 mesh,
+  // 只能 leave 再 join,而那会把 token 一起忘掉(它没写在别处)。
+  if (url || token || mode || seeds?.length) {
+    const config = { ...existing };
+    if (url) config.url = normalizeUrl(url);
+    if (token) config.token = token;
+    if (mode) {
+      if (!MODES.includes(mode)) return { ok: false, reason: `mode 只能是 ${MODES.join(" / ")},实际 "${mode}"` };
+      config.mode = mode;
+    }
+    if (seeds?.length) {
+      const clean = (Array.isArray(seeds) ? seeds : String(seeds).split(","))
+        .map((s) => String(s).trim())
+        .filter(Boolean);
+      if (clean.length) config.seeds = clean;
+    }
+    // 不写 labels:它是会话级的(见 options.js 顶部说明)。
+
     const path = writeTeam(team, config, home);
     return { ok: true, config, path, updated: true };
   }

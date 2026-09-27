@@ -204,7 +204,11 @@ async function runParty(party: Record<string, unknown> | undefined, ctx: Extensi
 
   switch (party.kind) {
     case "connect":
-      connectWith(party.team as string | null, party.config as { url: string; token: string; labels?: string[] });
+      connectWith(
+        party.team as string | null,
+        party.config as { url: string; token: string; labels?: string[] },
+        (party.session as { name?: string; labels?: string[]; port?: number; listen?: string }) ?? {},
+      );
       return true;
 
     case "disconnect":
@@ -287,21 +291,40 @@ function renderStatus() {
 function connectWith(
   team: string | null,
   config: { url?: string; token: string; labels?: string[]; mode?: string; seeds?: string[] },
+  /**
+   * 会话级选项,来自这次调用的参数,覆盖启动时的值。
+   *
+   * name 和 labels 不落盘:一台机器可以跑几个 Pi,每个是一个独立节点,
+   * 它们共用同一个 team 配置文件 —— 节点名存进去的话,第二个启动
+   * 就会把第一个覆盖掉,而名字就是身份。
+   */
+  session: { name?: string; labels?: string[]; port?: number; listen?: string } = {},
 ) {
   transport?.stop();
 
   currentTeam = team;
   currentConfig = config;
-  // 只在配置真的带了非空标签时才用它。
-  // 空数组是 truthy —— 直接赋值会把命令行 --team-labels 覆盖成空,
-  // 而 createTeam 写配置时恰好会留下 labels: []。
-  if (config.labels?.length) state.selfLabels = config.labels;
+
+  // 优先级:本次调用的参数 > 启动时的值。
+  // 注意 labels 用 length 判断:空数组是 truthy,直接赋值会把
+  // 启动时的 --team-labels 覆盖成空。
+  if (session.name) state.self = session.name;
+  if (session.labels?.length) {
+    state.selfLabels = session.labels;
+  } else if (!state.selfLabels?.length && config.labels?.length) {
+    // 旧版本会把标签写进 team 配置。现在不写了,但已经存下的要继续
+    // 生效,否则升级后已有用户的标签会悄悄消失 —— 而它们只在别人
+    // 用 @label 群发时才会被发现。
+    state.selfLabels = config.labels;
+  }
+
   state.members = [];
   state.pendingReplies = [];
   state.answering = [];
 
-  // 模式解析优先级:环境变量 > 配置 > 默认 broker
-  const resolved = resolveMode({ config });
+  // 模式只看配置。启动时的 TEAM_MODE 已经在下面并进去了 ——
+  // 这里再读环境变量的话,/team mode 切换就会被它压住,切不动。
+  const resolved = resolveMode({ config, env: {} });
   if (!resolved.ok) {
     ctxRef?.ui.notify(`team:${resolved.reason}`, "error");
     return;
@@ -317,8 +340,10 @@ function connectWith(
   const made = createTransport({
     mode: resolved.mode,
     config,
-    listenHost: process.env.TEAM_LISTEN_HOST ?? "0.0.0.0",
-    listenPort: Number(process.env.TEAM_LISTEN_PORT ?? 0),
+    // 优先级:本次调用的选项 > 启动时的环境变量 > 默认。
+    // 监听端口不落盘(见 options.js),所以这是它唯一的来源。
+    listenHost: session.listen ?? process.env.TEAM_LISTEN_HOST ?? "0.0.0.0",
+    listenPort: session.port ?? Number(process.env.TEAM_LISTEN_PORT ?? 0),
     advertiseHost: process.env.TEAM_ADVERTISE_HOST ?? null,
     sidecarPath: process.env.PI_TEAM_SWIM_SIDECAR ?? null,
   });
@@ -525,7 +550,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event) => {
     const list = others(state);
     const labels = knownLabels(state);
-    const mode = process.env.TEAM_MODE ?? "broker";
+    const mode = currentMode;
 
     const roster = list.length
       ? [...list]
@@ -710,12 +735,30 @@ export default function (pi: ExtensionAPI) {
     name: "team_join",
     label: "Team Join",
     description:
-      "加入一个 team。team 已在本机配置里时只需 team 名;首次加入需要 url 和 token。会连接 broker 并影响后续消息收发。",
-    promptSnippet: "team_join(team, url?, token?) — 加入 team",
+      "加入一个 team 并连接。team 已在本机配置里时只需 team 名;首次加入需要 token,以及 url(broker 模式)或 seeds(mesh/swim)。" +
+      "改 mode 或 seeds 也用它 —— 已有的 url/token 会保留,不会被清掉。",
+    promptSnippet:
+      "team_join(team, token?, url?, mode?, seeds?, name?, labels?, port?) — 加入或重新配置 team",
     parameters: Type.Object({
       team: Type.String({ description: "team 名(小写字母数字)" }),
-      url: Type.Optional(Type.String({ description: "broker URL,首次加入时必需" })),
       token: Type.Optional(Type.String({ description: "team token,首次加入时必需" })),
+      url: Type.Optional(Type.String({ description: "broker 地址,broker 模式必需,例如 http://100.64.0.1:8787" })),
+      mode: Type.Optional(
+        Type.Union([Type.Literal("broker"), Type.Literal("mesh"), Type.Literal("swim")], {
+          description: "投递模式。broker(默认)经中转;mesh/swim 节点直连,需要 seeds",
+        }),
+      ),
+      seeds: Type.Optional(
+        Type.Array(Type.String(), { description: "mesh/swim 的种子地址,形如 100.64.0.1:19801" }),
+      ),
+      name: Type.Optional(Type.String({ description: "本节点名。只影响本次运行,不写入配置" })),
+      labels: Type.Optional(Type.Array(Type.String(), { description: "本节点标签,供 @label 群发" })),
+      port: Type.Optional(
+        Type.Number({ description: "mesh/swim 的监听端口。只影响本次运行。0 = 让内核分配(默认)" }),
+      ),
+      listen: Type.Optional(
+        Type.String({ description: "mesh/swim 的监听地址,默认 0.0.0.0。只影响本次运行" }),
+      ),
     }),
 
     renderCall(args, theme) {
@@ -732,7 +775,19 @@ export default function (pi: ExtensionAPI) {
     },
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const r = await invoke({ sub: "join", args: [params.team, params.url ?? "", params.token ?? ""].filter(Boolean) }, ctx);
+      // 走和 /team join 同一个 dispatch —— 工具的选项必须和命令的选项
+      // 完全一致,否则模型能设的东西和人能设的东西会分叉。
+      const args: string[] = [params.team];
+      if (params.url) args.push("--url", params.url);
+      if (params.token) args.push("--token", params.token);
+      if (params.mode) args.push("--mode", params.mode);
+      if (params.seeds?.length) args.push("--seeds", params.seeds.join(","));
+      if (params.name) args.push("--name", params.name);
+      if (params.labels?.length) args.push("--labels", params.labels.join(","));
+      if (params.port !== undefined) args.push("--port", String(params.port));
+      if (params.listen) args.push("--listen", params.listen);
+
+      const r = await invoke({ sub: "join", args }, ctx);
       return {
         content: [{ type: "text", text: r.ok ? r.lines.join("\n") : `失败:${r.error}` }],
         details: { ok: r.ok, lines: r.ok ? r.lines : [r.error] },
@@ -811,7 +866,9 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("team", {
     description: "Pi Agent Team:状态 / 成员 / 发送 / team 生命周期 / 标签",
     getArgumentCompletions(prefix) {
-      const subs = ["status", "peers", "create", "join", "leave", "label", "send", "announce", "on", "off"];
+      const subs = [
+        "status", "peers", "create", "join", "leave", "mode", "label", "send", "announce", "on", "off",
+      ];
       if (!prefix.includes(" ")) {
         return subs.filter((s) => s.startsWith(prefix)).map((s) => ({ value: s, label: s, description: `/team ${s}` }));
       }
@@ -841,6 +898,40 @@ export default function (pi: ExtensionAPI) {
         return listTeams().map((t) => ({ value: t, label: t, description: "本机已有配置" }));
       }
 
+      // join / create / mode 的选项补全 —— 否则这些选项只能靠记。
+      //
+      // autocomplete 的 value 替换的是**整个参数串**,不是最后一个词。
+      // 所以这里必须把前缀原样带上,只换掉正在输入的那一段;否则
+      // `/team join dev --m` 选中后会把 `dev` 一起吞掉,team 名就没了。
+      const completeToken = (options) => {
+        const tokens = partial.split(" ");
+        const head = tokens.slice(0, -1);
+        const last = tokens[tokens.length - 1] ?? "";
+        return options
+          .filter((o) => o.option.startsWith(last))
+          .map((o) => ({ value: [...head, o.option].join(" "), label: o.option, description: o.description }));
+      };
+
+      if (sub === "join" || sub === "create") {
+        const cur = partial.split(" ").pop() ?? "";
+        // 只有正在输入一个 -- 选项时才提示选项,免得打字时一直刷列表
+        if (partial === "" || cur.startsWith("--")) {
+          return completeToken([
+            { option: "--url", description: "broker 地址" },
+            { option: "--token", description: "team token" },
+            { option: "--mode", description: "broker | mesh | swim" },
+            { option: "--seeds", description: "host:port,..." },
+            { option: "--name", description: "本节点名(仅本次运行)" },
+            { option: "--labels", description: "标签,逗号分隔" },
+          ]);
+        }
+        return null;
+      }
+
+      if (sub === "mode") {
+        return completeToken(["broker", "mesh", "swim"].map((m) => ({ option: m })));
+      }
+
       if (sub === "announce") {
         return ["off", "auto", "always"]
           .filter((m) => m.startsWith(partial))
@@ -862,7 +953,9 @@ export default function (pi: ExtensionAPI) {
       const r = await invoke({ sub: parts[0], args: parts.slice(1) }, ctx);
 
       if (!r.ok) {
-        ctx.ui.notify(r.error!, "warning");
+        // error 而不是 warning:命令没执行成功。显示成警告会让人以为
+        // 部分是成功的(实测中确实造成了这个误解)。
+        ctx.ui.notify(r.error!, "error");
         return;
       }
       // 意图执行阶段已经 notify 过 notes,这里只报 lines
@@ -872,15 +965,87 @@ export default function (pi: ExtensionAPI) {
 
   // ---------------------------------------------------------------- 菜单
 
+  /**
+   * join / create 的交互向导。
+   *
+   * 先问模式,再按模式问地址 —— 要问什么取决于模式:broker 要 URL,
+   * mesh/swim 要种子。以前的向导只问 URL,于是从菜单加入 mesh team
+   * 会卡在一个根本用不上的必填项上。
+   *
+   * 返回 /team join 能直接吃的参数数组,和命令行完全同一套选项。
+   * 用户中途取消时返回 null。
+   */
+  async function askJoinOptions(
+    ctx: ExtensionContext,
+    { allowNewTeam = false, isCreate = false }: { allowNewTeam?: boolean; isCreate?: boolean } = {},
+  ): Promise<string[] | null> {
+    let teamName: string;
+    let existing: { mode?: string; url?: string; token?: string } | null = null;
+
+    if (isCreate) {
+      const t = await ctx.ui.input("新 team 名", "小写字母数字");
+      if (!t?.trim()) return null;
+      teamName = t.trim();
+    } else {
+      const known = listTeams();
+      const NEW = "(输入新的 team)";
+      const picked = await ctx.ui.select("加入哪个 team?", allowNewTeam ? [...known, NEW] : known);
+      if (!picked) return null;
+      if (picked === NEW) {
+        const t = await ctx.ui.input("team 名", "小写字母数字");
+        if (!t?.trim()) return null;
+        teamName = t.trim();
+      } else {
+        teamName = picked;
+        existing = readTeam(picked);
+        // 已有配置的 team 直接加入,不重复问 —— 要改配置用 /team mode
+        // 或者带选项的 /team join。
+        if (existing?.token) return [teamName];
+      }
+    }
+
+    const modePick = await ctx.ui.select("连接模式", [
+      "broker  —  经一个中转进程(推荐,最省事)",
+      "mesh  —  节点直连,无中心",
+      "swim  —  SWIM 管成员,节点直连投递",
+    ]);
+    if (!modePick) return null;
+    const mode = modePick.split(" ")[0];
+
+    const args = [teamName, "--mode", mode];
+
+    if (mode === "broker") {
+      const u = await ctx.ui.input("broker 地址", "http://<tailscale-ip>:8787");
+      if (!u?.trim()) return null;
+      args.push("--url", u.trim());
+    } else {
+      // 种子可以不填:第一个节点本来就没有别人可以指向
+      const seeds = await ctx.ui.input(
+        "种子地址(已在线节点的地址,可留空)",
+        mode === "swim" ? "host:gossip端口,留空 = 你是第一个节点" : "host:端口,留空 = 你是第一个节点",
+      );
+      if (seeds?.trim()) args.push("--seeds", seeds.trim());
+    }
+
+    // create 时 token 可以省略,会自动生成
+    const k = await ctx.ui.input(
+      "token",
+      isCreate ? "留空自动生成" : "openssl rand -hex 32 生成的那个",
+    );
+    if (k?.trim()) args.push("--token", k.trim());
+    else if (!isCreate) return null;
+
+    return args;
+  }
+
   async function menu(ctx: ExtensionContext) {
     const list = others(state);
-
     const choices: { label: string; run: () => Promise<void> }[] = [
       {
         label: "📋 查看成员",
         run: async () => {
           const r = await invoke({ sub: "peers", args: [] }, ctx);
-          if (r.lines.length) ctx.ui.notify(r.lines.join("\n"), r.ok ? "info" : "warning");
+          if (r.lines.length) ctx.ui.notify(r.lines.join("\n"), r.ok ? "info" : "error");
         },
       },
       {
@@ -897,7 +1062,7 @@ export default function (pi: ExtensionAPI) {
           const text = await ctx.ui.input(`发给 ${target.name}`, "消息内容");
           if (!text?.trim()) return;
           const r = await invoke({ sub: "send", args: [target.name, text] }, ctx);
-          if (!r.ok) ctx.ui.notify(r.error!, "warning");
+          if (!r.ok) ctx.ui.notify(r.error!, "error");
         },
       },
       {
@@ -918,7 +1083,7 @@ export default function (pi: ExtensionAPI) {
           if (!text?.trim()) return;
 
           const r = await invoke({ sub: "send", args: [to, text] }, ctx);
-          if (!r.ok) ctx.ui.notify(r.error!, "warning");
+          if (!r.ok) ctx.ui.notify(r.error!, "error");
         },
       },
       {
@@ -941,7 +1106,7 @@ export default function (pi: ExtensionAPI) {
           if (!input?.trim()) return;
           const names = input.split(",").map((s) => s.trim()).filter(Boolean);
           const r = await invoke({ sub: "label", args: [action, ...names] }, ctx);
-          if (!r.ok) ctx.ui.notify(r.error!, "warning");
+          if (!r.ok) ctx.ui.notify(r.error!, "error");
         },
       },
       {
@@ -966,56 +1131,44 @@ export default function (pi: ExtensionAPI) {
 
           if (action === "leave") {
             const r = await invoke({ sub: "leave", args: [] }, ctx);
-            return void ctx.ui.notify(r.ok ? r.lines.join("\n") : r.error!, r.ok ? "info" : "warning");
+            return void ctx.ui.notify(r.ok ? r.lines.join("\n") : r.error!, r.ok ? "info" : "error");
           }
 
           if (action === "join") {
-            const known = listTeams();
-            const NEW = "(输入新的 team)";
-            const picked = await ctx.ui.select("加入哪个 team?", [...known, NEW]);
-            if (!picked) return;
-
-            let teamName: string;
-            let url: string | undefined;
-            let token: string | undefined;
-
-            if (picked === NEW) {
-              const t = await ctx.ui.input("team 名", "小写字母数字");
-              if (!t?.trim()) return;
-              teamName = t.trim();
-              const u = await ctx.ui.input("broker URL", "http://<tailscale-ip>:8787");
-              if (!u?.trim()) return;
-              url = u.trim();
-              const k = await ctx.ui.input("token", "openssl rand -hex 32 生成的那个");
-              if (!k?.trim()) return;
-              token = k.trim();
-            } else {
-              teamName = picked;
-            }
-
-            const r = await invoke({ sub: "join", args: [teamName, url, token].filter(Boolean) as string[] }, ctx);
-            return void ctx.ui.notify(r.ok ? r.lines.join("\n") : r.error!, r.ok ? "info" : "warning");
+            const args = await askJoinOptions(ctx, { allowNewTeam: true });
+            if (!args) return;
+            const r = await invoke({ sub: "join", args }, ctx);
+            return void ctx.ui.notify(r.ok ? r.lines.join("\n") : r.error!, r.ok ? "info" : "error");
           }
 
           if (action === "create") {
-            const t = await ctx.ui.input("新 team 名", "小写字母数字");
-            if (!t?.trim()) return;
-            const u = await ctx.ui.input("broker URL", "http://<tailscale-ip>:8787");
-            if (!u?.trim()) return;
-
-            const r = await invoke({ sub: "create", args: [t.trim(), u.trim()] }, ctx);
-            if (!r.ok) return void ctx.ui.notify(r.error!, "warning");
+            const args = await askJoinOptions(ctx, { allowNewTeam: true, isCreate: true });
+            if (!args) return;
+            const r = await invoke({ sub: "create", args }, ctx);
+            if (!r.ok) return void ctx.ui.notify(r.error!, "error");
             // token 只显示这一次,单独提示,避免被后续 notify 冲掉
             const tokenLine = r.lines.find((l) => /^[0-9a-f]{64}$/.test(l));
-            if (tokenLine) {
-              ctx.ui.notify(
-                `team "${t.trim()}" 已创建并连接。\n\ntoken(只显示这一次,也在配置文件里):\n${tokenLine}\n\n其它机器用:/team join ${t.trim()} ${u.trim()} <token>`,
-                "info",
-              );
-            } else {
-              ctx.ui.notify(r.lines.join("\n"), "info");
-            }
+            ctx.ui.notify(
+              tokenLine
+                ? `team "${args[0]}" 已创建并连接。\n\ntoken(只显示这一次,也在配置文件里):\n${tokenLine}\n\n${r.lines.find((l) => l.startsWith("/team join")) ?? ""}`
+                : r.lines.join("\n"),
+              "info",
+            );
           }
+        },
+      },
+      {
+        label: `🧭 连接模式  (当前:${currentMode})`,
+        run: async () => {
+          const pick = await ctx.ui.select("连接模式", [
+            "broker  —  经一个中转进程,需要 URL",
+            "mesh  —  节点直连,需要种子地址",
+            "swim  —  SWIM 管成员 + 直连投递,需要种子和边车",
+          ]);
+          if (!pick) return;
+          const want = pick.split(" ")[0];
+          const r = await invoke({ sub: "mode", args: [want] }, ctx);
+          ctx.ui.notify(r.ok ? r.lines.join("\n") : r.error!, r.ok ? "info" : "error");
         },
       },
       {
@@ -1028,7 +1181,7 @@ export default function (pi: ExtensionAPI) {
           ]);
           if (!pick) return;
           const r = await invoke({ sub: "announce", args: [pick.split(" ")[0]] }, ctx);
-          if (!r.ok) ctx.ui.notify(r.error!, "warning");
+          if (!r.ok) ctx.ui.notify(r.error!, "error");
         },
       },
       {

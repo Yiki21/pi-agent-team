@@ -93,6 +93,13 @@ export function createMeshTransport({
   seeds = [],
   listenHost = "0.0.0.0",
   listenPort = 0,
+  /**
+   * 保留参数但不使用,只是为了让调用方不必按模式分支传参。
+   *
+   * 地址是**从入站连接的来源地址学来的**,不是对端自述的。这样对端
+   * 无法让我们去连一个它编出来的地址,也就不存在"通告错了连不上"
+   * 这类问题;代价是两端都在 NAT 后面时需要别的办法(见 docs)。
+   */
   advertiseHost = null,
   heartbeatMs = HEARTBEAT_MS,
   helloTimeoutMs = HELLO_TIMEOUT_MS,
@@ -160,7 +167,6 @@ export function createMeshTransport({
       host: self?.host ?? null,
       labels: self?.labels ?? [],
       listen: boundPort,
-      advertise: advertiseHost,
       members: members().map((m) => ({
         name: m.name,
         host: m.host,

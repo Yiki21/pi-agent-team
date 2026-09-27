@@ -21,6 +21,8 @@ import {
   teamSize,
 } from "./session.js";
 import { createTeam, joinTeam, leaveTeam, listTeams, readTeam } from "./team-config.js";
+import { OPTION_HELP, checkModeRequirements, parseOptionArgs, validateOptions } from "./options.js";
+import { MODES } from "./mode.js";
 
 /** 群发前确认阈值。每个收件人都会跑一轮完整思考,不该手滑就发生。 */
 export const BULK_WARN_THRESHOLD = 5;
@@ -93,10 +95,13 @@ export function dispatch(input, state, env) {
       return createResult(args, state);
 
     case "join":
-      return joinResult(args);
+      return joinResult(args, state);
 
     case "leave":
       return leaveResult(args, state, env);
+
+    case "mode":
+      return modeResult(args, state, env);
 
     case "label":
       return labelResult(args, state, env);
@@ -188,13 +193,44 @@ function peersResult(state) {
 // ---------------------------------------------------------------- team 生命周期
 
 function createResult(args, state) {
-  const [team, url, token] = args;
-  if (!team || !url) return bad("用法:/team create <team> <url> [token]");
+  // 位置形式(/team create t <url> [token])和选项形式都接受。
+  // 位置形式保留是因为它用了很久,选项形式是为了设置 mode/seeds。
+  const parsed = parseOptionArgs(args);
+  if (parsed.unknown.length) return bad(`认不出的选项:${parsed.unknown.join(", ")}\n${OPTION_HELP}`);
 
-  const r = createTeam({ team, url, token, labels: state.selfLabels ?? [] });
+  const [team, posUrl, posToken] = parsed.rest;
+  if (!team) return bad(`用法:/team create <team> [url] [token] [选项]\n${OPTION_HELP}`);
+
+  const values = { ...parsed.values };
+  if (posUrl && !values.url) values.url = posUrl;
+  if (posToken && !values.token) values.token = posToken;
+
+  const v = validateOptions(values);
+  if (!v.ok) return bad(v.reason);
+
+  const mode = v.team.mode ?? "broker";
+  const req = checkModeRequirements({
+    mode,
+    url: v.team.url,
+    seeds: v.team.seeds,
+    token: v.team.token ?? "(待生成)",
+  });
+  if (!req.ok) return bad(req.reason);
+
+  const r = createTeam({
+    team,
+    url: v.team.url,
+    token: v.team.token,
+    mode,
+    seeds: v.team.seeds ?? [],
+  });
   if (!r.ok) return bad(r.reason);
 
-  const lines = [`已创建 team "${team}"  →  ${r.path}`, `broker: ${r.config.url}`];
+  const lines = [`已创建 team "${team}"  →  ${r.path}`, `模式: ${r.config.mode}`];
+  if (r.config.url) lines.push(`broker: ${r.config.url}`);
+  if (r.config.seeds?.length) lines.push(`seeds: ${r.config.seeds.join(", ")}`);
+  if (req.warning) lines.push("", `注意:${req.warning}`);
+
   if (r.created) {
     lines.push(
       "",
@@ -202,23 +238,128 @@ function createResult(args, state) {
       r.token,
       "",
       "其它机器用这条加入:",
-      `/team join ${team} ${r.config.url} <token>`,
+      `/team join ${team} --url ${r.config.url ?? "<url>"} --token ${r.token}${
+        r.config.mode !== "broker" ? ` --mode ${r.config.mode}` : ""
+      }`,
     );
   }
   // 创建后直接连上,省得用户再敲一次 join
-  return ok(lines, { party: { kind: "connect", team, config: r.config } });
+  return ok(lines, {
+    party: {
+      kind: "connect",
+      team,
+      config: r.config,
+      session: v.session,
+    },
+  });
 }
 
-function joinResult(args) {
-  const [team, url, token] = args;
-  if (!team) return bad("用法:/team join <team> [url] [token]");
+function joinResult(args, state) {
+  const parsed = parseOptionArgs(args);
+  if (parsed.unknown.length) return bad(`认不出的选项:${parsed.unknown.join(", ")}\n${OPTION_HELP}`);
 
-  const r = joinTeam({ team, url, token });
+  const [team, posUrl, posToken] = parsed.rest;
+  if (!team) return bad(`用法:/team join <team> [url] [token] [选项]\n${OPTION_HELP}`);
+
+  const values = { ...parsed.values };
+  if (posUrl && !values.url) values.url = posUrl;
+  if (posToken && !values.token) values.token = posToken;
+
+  const v = validateOptions(values);
+  if (!v.ok) return bad(v.reason);
+
+  // 已有配置时,mode/seeds 必须能改 —— 否则想从 broker 换成 mesh
+  // 就只能 leave 再 join,而那会把 token 也一起忘掉。
+  const existing = readTeam(team);
+  const mode = v.team.mode ?? existing?.mode ?? "broker";
+
+  const req = checkModeRequirements({
+    mode,
+    url: v.team.url ?? existing?.url,
+    seeds: v.team.seeds ?? existing?.seeds,
+    token: v.team.token ?? existing?.token,
+  });
+  if (!req.ok) return bad(req.reason);
+
+  const r = joinTeam({
+    team,
+    url: v.team.url,
+    token: v.team.token,
+    mode: v.team.mode,
+    seeds: v.team.seeds,
+  });
   if (!r.ok) return bad(r.reason);
 
-  const lines = [`加入 team "${team}"`, `broker: ${r.config.url}`];
+  const lines = [`加入 team "${team}"`, `模式: ${r.config.mode}`];
+  if (r.config.url) lines.push(`broker: ${r.config.url}`);
+  if (r.config.seeds?.length) lines.push(`seeds: ${r.config.seeds.join(", ")}`);
   if (r.adopted) lines.push("(首次加入,已记到本机配置)");
-  return ok(lines, { party: { kind: "connect", team, config: r.config } });
+  if (r.updated) lines.push("(配置已更新)");
+  if (req.warning) lines.push("", `注意:${req.warning}`);
+
+  return ok(lines, {
+    party: {
+      kind: "connect",
+      team,
+      config: r.config,
+      session: v.session,
+    },
+  });
+}
+
+/** /team mode —— 查看或切换模式,不必重敲 url/token */
+function modeResult(args, state, env) {
+  const want = (args[0] ?? "").toLowerCase();
+
+  if (!want) {
+    const current = env.mode ?? env.config?.mode ?? "broker";
+    return ok([
+      `当前模式:${current}`,
+      "",
+      "切换:",
+      "  /team mode broker   经 broker 中转,需要 url",
+      "  /team mode mesh     节点直连,需要 seeds",
+      "  /team mode swim     SWIM 管成员 + 直连投递,需要 seeds 和边车",
+      "",
+      "只切换模式不会动 url / token / seeds —— 它们在 team 配置里。",
+      "需要改那些就用 /team join <team> --url ... --token ...。",
+    ]);
+  }
+
+  if (!MODES.includes(want)) return bad(`模式只能是 ${MODES.join(" / ")},实际 "${want}"`);
+
+  const team = env.team;
+  if (!team) {
+    return bad("还没绑定 team,无法保存模式。用 /team join <team> --mode " + want + " ...");
+  }
+
+  const existing = readTeam(team);
+  if (!existing) return bad(`本地没有 team "${team}" 的配置`);
+
+  const req = checkModeRequirements({
+    mode: want,
+    url: existing.url,
+    seeds: existing.seeds,
+    token: existing.token,
+  });
+  if (!req.ok) return bad(req.reason);
+
+  const r = joinTeam({ team, mode: want });
+  if (!r.ok) return bad(r.reason);
+
+  const lines = [`模式已切换:${existing.mode ?? "broker"} → ${want}`];
+  if (req.warning) lines.push("", `注意:${req.warning}`);
+  if (want === "swim") lines.push("", "swim 需要边车:cd swim && go build -o ../.tmp/swim-sidecar .");
+
+  return ok(lines, { party: { kind: "connect", team, config: r.config, session: sessionFrom(state) } });
+}
+
+/** 把当前会话级的选项打包给 connect */
+function sessionFrom(state) {
+  const out = {};
+  if (state.self) out.name = state.self;
+  if (state.selfLabels?.length) out.labels = state.selfLabels;
+  return out;
 }
 
 function leaveResult(args, state, env) {

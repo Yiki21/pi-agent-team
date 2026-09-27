@@ -430,3 +430,172 @@ test("契约:正文非空 —— 空正文会被接收方丢弃", () => {
   assert.ok(send, `应有 send 意图,实际 ${JSON.stringify(r)}`);
   assert.ok(send.text.length > 0);
 });
+
+// ---------------------------------------------------------------- 连接选项(三个入口共用)
+
+/**
+ * 把 HOME 指到临时目录,让 team 配置写到那里。
+ * os.homedir() 在 Linux 上每次都读 $HOME,所以这样能覆盖真实写盘路径。
+ */
+function isolatedHome(t) {
+  const home = mkdtempSync(join(tmpdir(), "dispatch-opts-"));
+  const prev = process.env.HOME;
+  process.env.HOME = home;
+  t.after(() => {
+    process.env.HOME = prev;
+    rmSync(home, { recursive: true, force: true });
+  });
+  return home;
+}
+
+const TOKEN64 = "a".repeat(64);
+
+test("join:--mode/--seeds 首次加入就生效并落盘", async (t) => {
+  isolatedHome(t);
+  const { readTeam } = await import("./team-config.js");
+  const c = setup();
+
+  const r = run("join", ["meshy", "--mode", "mesh", "--seeds", "10.0.0.1:19801", "--token", TOKEN64], c);
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.party.kind, "connect");
+  assert.equal(r.party.config.mode, "mesh");
+  assert.deepEqual(r.party.config.seeds, ["10.0.0.1:19801"]);
+
+  const saved = readTeam("meshy");
+  assert.equal(saved.mode, "mesh", "mode 要写进 team 配置,下次启动不用再给");
+  assert.deepEqual(saved.seeds, ["10.0.0.1:19801"]);
+});
+
+test("join:已有 team 可以只改 mode,token 和 url 保留", async (t) => {
+  isolatedHome(t);
+  const { readTeam } = await import("./team-config.js");
+  const c = setup();
+
+  run("join", ["t2", "--url", "http://10.0.0.1:8787", "--token", TOKEN64], c);
+  const r = run("join", ["t2", "--mode", "mesh", "--seeds", "10.0.0.2:19801"], c);
+  assert.equal(r.ok, true, r.error);
+
+  const saved = readTeam("t2");
+  assert.equal(saved.mode, "mesh");
+  assert.equal(saved.token, TOKEN64, "改 mode 不能把 token 丢掉 —— 它没存在别的地方");
+  assert.equal(saved.url, "http://10.0.0.1:8787");
+});
+
+test("join:--name 只进本次连接,绝不写进 team 配置", async (t) => {
+  isolatedHome(t);
+  const { readTeam } = await import("./team-config.js");
+  const c = setup();
+
+  const r = run("join", ["t3", "--url", "http://h:1", "--token", TOKEN64, "--name", "dev01-web"], c);
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.party.session.name, "dev01-web", "名字要传给这次连接");
+
+  const saved = readTeam("t3");
+  assert.equal(
+    "name" in saved,
+    false,
+    "名字不能落盘:同一台机器上的几个 Pi 共用这个文件,存进去第二个会把第一个顶掉",
+  );
+});
+
+test("join:位置参数形式仍然可用(向后兼容)", async (t) => {
+  isolatedHome(t);
+  const c = setup();
+  const r = run("join", ["t4", "http://h:1", TOKEN64], c);
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.party.config.url, "http://h:1");
+  assert.equal(r.party.config.mode, "broker");
+});
+
+test("join:broker 模式缺 url 时报错并给写法", async (t) => {
+  isolatedHome(t);
+  const c = setup();
+  const r = run("join", ["t5", "--token", TOKEN64], c);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /--url/);
+});
+
+test("join:mesh 缺 seeds 时可以加入,但结果里要带警告", async (t) => {
+  isolatedHome(t);
+  const c = setup();
+  const r = run("join", ["t6", "--mode", "mesh", "--token", TOKEN64], c);
+  assert.equal(r.ok, true, r.error);
+  assert.ok(r.lines.some((l) => /seeds/.test(l)), "要提醒没有种子的后果");
+});
+
+test("join:拼错的选项被拒,不是静默忽略", async (t) => {
+  isolatedHome(t);
+  const c = setup();
+  const r = run("join", ["t7", "--mod", "mesh", "--token", TOKEN64], c);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /mod/);
+});
+
+test("create:支持 --mode/--seeds,并给出其它机器的加入命令", async (t) => {
+  isolatedHome(t);
+  const c = setup();
+  const r = run("create", ["t8", "--mode", "mesh", "--seeds", "10.0.0.1:19801"], c);
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.party.config.mode, "mesh");
+  const joinLine = r.lines.find((l) => l.startsWith("/team join"));
+  assert.ok(joinLine, "要给出别的机器怎么加入");
+  assert.match(joinLine, /--mode mesh/, "加入命令必须带上模式,否则对方会按 broker 连");
+});
+
+test("mode:切换模式时 url/token/seeds 不动", async (t) => {
+  isolatedHome(t);
+  const { readTeam } = await import("./team-config.js");
+  const c = setup();
+  run("join", ["t9", "--url", "http://h:1", "--token", TOKEN64, "--seeds", "10.0.0.1:19801"], c);
+
+  const c2 = setup({ team: "t9" });
+  const r = run("mode", ["mesh"], c2);
+  assert.equal(r.ok, true, r.error);
+
+  const saved = readTeam("t9");
+  assert.equal(saved.mode, "mesh");
+  assert.equal(saved.url, "http://h:1");
+  assert.equal(saved.token, TOKEN64);
+  assert.deepEqual(saved.seeds, ["10.0.0.1:19801"]);
+});
+
+test("mode:切到 broker 但配置里没 url 时拒绝", async (t) => {
+  isolatedHome(t);
+  const c = setup();
+  run("join", ["t10", "--mode", "mesh", "--token", TOKEN64, "--seeds", "10.0.0.1:1"], c);
+
+  const r = run("mode", ["broker"], setup({ team: "t10" }));
+  assert.equal(r.ok, false);
+  assert.match(r.error, /url/);
+});
+
+test("mode:不带参数时显示当前模式和用法", () => {
+  const r = run("mode", [], setup({ config: { mode: "mesh", token: "t" } }));
+  assert.equal(r.ok, true);
+  assert.match(r.lines[0], /mesh/);
+});
+
+test("mode:非法模式被拒", () => {
+  const r = run("mode", ["raft"], setup());
+  assert.equal(r.ok, false);
+  assert.match(r.error, /broker/);
+});
+
+test("join:--port/--listen 只影响本次连接,不落盘", async (t) => {
+  isolatedHome(t);
+  const { readTeam } = await import("./team-config.js");
+  const c = setup();
+
+  const r = run("join", ["tp", "--mode", "mesh", "--seeds", "10.0.0.1:1", "--token", TOKEN64, "--port", "19801", "--listen", "127.0.0.1"], c);
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.party.session.port, 19801);
+  assert.equal(r.party.session.listen, "127.0.0.1");
+
+  const saved = readTeam("tp");
+  assert.equal(
+    "port" in saved,
+    false,
+    "端口不能落盘:同机第二个 agent 会监听同一个端口,EADDRINUSE 起不来",
+  );
+  assert.equal("listen" in saved, false);
+});
