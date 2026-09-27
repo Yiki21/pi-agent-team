@@ -9,7 +9,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -96,4 +96,20 @@ test("零运行时依赖,尤其不能依赖自己", () => {
   // 而旧版本的 peer 没标 optional,于是整套 Pi(435 MB)被拖进来。
   assert.equal(pkg.dependencies?.[pkg.name], undefined, "包不能依赖它自己");
   assert.deepEqual(Object.keys(pkg.dependencies ?? {}), [], "应当零运行时依赖");
+});
+
+test("README 里的相对链接都有对应文件,且会被发布", () => {
+  // 之前加了 docs/systemd.md 的链接却没把 docs/ 放进 files ——
+  // 从 npm 装的用户点过去是死链,而仓库里一切正常。
+  const readme = readFileSync(join(ROOT, "README.md"), "utf8");
+  const links = [...readme.matchAll(/\]\((?!https?:)([^)#]+)\)/g)].map((m) => m[1]);
+  assert.ok(links.length > 0, "前置条件:README 里应有相对链接");
+
+  for (const link of links) {
+    const target = link.replace(/^\.\//, "");
+    assert.ok(existsSync(join(ROOT, target)), `README 链接的 ${link} 不存在`);
+    // 顶层目录要整个发布;文件要逐个列出
+    const covered = files.has(target) || [...files].some((f) => f.endsWith("/") && target.startsWith(f));
+    assert.ok(covered, `README 链接到 ${link},但它在发布包里缺失`);
+  }
 });

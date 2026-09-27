@@ -1,6 +1,6 @@
 {
   "name": "@yiki21/pi-agent-team",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Turn several machines running the Pi coding agent into one team over your tailnet. Three transports (broker / mesh / SWIM), one shared API and conformance suite.",
   "license": "MIT",
   "author": "Yiki21",
@@ -36,6 +36,7 @@
   "files": [
     "broker.mjs",
     "index.ts",
+    "docs/",
     "skills/",
     "swim/main.go",
     "swim/go.mod",
