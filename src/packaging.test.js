@@ -49,3 +49,37 @@ test("index.ts 引用的 src 模块都会被发布", () => {
   const missing = imported.filter((f) => !files.has(f));
   assert.deepEqual(missing, [], `index.ts 导入了这些,但它们不会被发布:${missing.join(", ")}`);
 });
+
+test("bin 指向的文件都会被发布,且路径不带 ./ 前缀", () => {
+  // npm 11 会把 "./broker.mjs" 标为 invalid 并在发布时"纠正"。
+  // 目前纠正后还能用,但依赖它的纠错不是个可靠的前提 —— 哪天不再纠正,
+  // README 第一步的 pi-agent-team-broker 就会变成 command not found。
+  for (const [cmd, path] of Object.entries(pkg.bin ?? {})) {
+    assert.equal(path.startsWith("./"), false, `bin.${cmd} 不该带 ./ 前缀,实际 "${path}"`);
+    assert.ok(files.has(path), `bin.${cmd} 指向 ${path},但它不在 files 里`);
+  }
+});
+
+test("bin 指向的文件有 shebang,否则装完不能直接执行", () => {
+  for (const [cmd, path] of Object.entries(pkg.bin ?? {})) {
+    const head = readFileSync(join(ROOT, path), "utf8").split("\n")[0];
+    assert.match(head, /^#!.*node/, `bin.${cmd} (${path}) 第一行应是 #!/usr/bin/env node`);
+  }
+});
+
+test("所有 peerDependency 都标了 optional", () => {
+  // 这个包有两种用法:作为 Pi 扩展(peer 必须存在),以及只为跑 broker
+  // 而安装(那台机器上不需要 Pi)。
+  //
+  // 不标 optional 时 npx -p 会把 Pi 连同它的依赖一起拉下来 —— 实测
+  // 435 MB,而 broker 只是个单文件脚本。npm install 只花 532 KB,所以
+  // 只看 npm install 发现不了;0.2.0 就是这么发出去的。
+  const peers = Object.keys(pkg.peerDependencies ?? {});
+  const meta = pkg.peerDependenciesMeta ?? {};
+  const required = peers.filter((p) => meta[p]?.optional !== true);
+  assert.deepEqual(
+    required,
+    [],
+    `这些 peer 没标 optional,npx 会强装它们:${required.join(", ")}`,
+  );
+});

@@ -74,11 +74,15 @@ openssl rand -hex 32
 
 ### Option A — broker
 
-Run the broker on one always-on machine:
+Run the broker on one always-on machine. It does not need Pi, only Node:
 
 ```bash
-TEAM_TOKEN=<token> pi-agent-team-broker --bind "$(tailscale ip -4)"
+TEAM_TOKEN=<token> npx -y -p @yiki21/pi-agent-team pi-agent-team-broker --bind "$(tailscale ip -4)"
 ```
+
+`pi install` puts the package somewhere that is not on your `PATH`, so the
+broker command is run through `npx` rather than by name. For a permanent setup,
+`npm install -g @yiki21/pi-agent-team` gives you `pi-agent-team-broker` directly.
 
 Then each node:
 
