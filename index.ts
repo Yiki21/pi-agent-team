@@ -30,7 +30,7 @@ import { Type } from "typebox";
 
 import { createBrokerTransport, CLOSE_REPLACED } from "./src/transport.js";
 import { MODES, createTransport, modeReadiness, normalizeSeeds, resolveMode } from "./src/mode.js";
-import { createSessionState, handleIncoming, knownLabels, onTurnSettled, others, teamSize, applyRoster } from "./src/session.js";
+import { createSessionState, handleIncoming, knownLabels, newId, onTurnSettled, observeMessage, others, teamSize, applyRoster } from "./src/session.js";
 import { createTeam, joinTeam, leaveTeam, listTeams, readTeam, toSocketUrl } from "./src/team-config.js";
 import { BULK_WARN_THRESHOLD, dispatch, doSend, sendMessage } from "./src/dispatch.js";
 
@@ -62,6 +62,21 @@ let currentConfig: { url: string; token: string; labels?: string[] } | null = nu
 let ctxRef: ExtensionContext | null = null;
 let apiRef: ExtensionAPI | null = null;
 
+/**
+ * 当前 run 是否在处理中。
+ *
+ * 不能用 ctx.isIdle() 判断。实测两条背靠背注入时,它在同一 tick 里
+ * 两次都返回 true,于是第二条走"直发"路径,被 Pi 以
+ * "Agent is already processing a prompt" 拒绝 —— 请求整个丢失,
+ * 比"只回最后一个"严重得多。
+ *
+ * 所以自己维护:注入后立刻置忙,agent_settled 时置闲。
+ */
+let runBusy = false;
+
+/** 同 tick 连续注入的防重入 —— 第一条发出后马上置位,不等事件回调 */
+let injectedThisTick = false;
+
 /** dispatch 需要的环境快照 */
 const envOf = () => ({
   connState,
@@ -76,6 +91,31 @@ const envOf = () => ({
 });
 
 // ---------------------------------------------------------------- 意图执行
+
+/**
+ * 注入失败时告诉发信人。
+ *
+ * 不这么做的话,发信人只会看到自己的请求发出去了,然后一直等回信 ——
+ * 而回信永远不会来,因为它根本没进模型。这可能发生在 Pi 正忙、注入被拒
+ * 的时候。
+ *
+ * 用一条 noReply 的说明发回去,而不是让它当成一次正常回复(那会再触发
+ * 一轮无意义的思考)。
+ */
+async function notifyInjectFailure(from: string, reason: string, ctx: ExtensionContext) {
+  if (!from) return;
+  const text = `[系统] 你的消息没有送达 ${state.self}:注入失败(${reason})。请重发。`;
+
+  // 直接在传输层构造信封。inbound 的 id 已经记在 seen 里，不走
+  // sendMessage —— 那样会把它当成一次普通发送而记入 outbound，
+  // 让对端的 re 能对着一个我们没真正发过的请求。
+  try {
+    transport?.send({ to: from, id: newId(), re: null, body: { text, hops: 1, fyi: true } });
+  } catch {
+    // 连失败通知都发不出去就只留着本机 notify，不再递归上报
+    void ctx;
+  }
+}
 
 /**
  * 执行 dispatch 产出的意图。这是唯一的"意图 → 副作用"映射点,
@@ -130,13 +170,22 @@ async function runIntentions(
       }
 
       case "inject": {
+        const payload = String(it.payload);
         try {
-          if (ctx.isIdle()) apiRef?.sendUserMessage(String(it.payload));
-          else apiRef?.sendUserMessage(String(it.payload), { deliverAs: "followUp" });
+          // 用自维护的忙标志,不用 ctx.isIdle()
+          if (!runBusy && !injectedThisTick) {
+            apiRef?.sendUserMessage(payload);
+          } else {
+            apiRef?.sendUserMessage(payload, { deliverAs: "followUp" });
+          }
+          injectedThisTick = true;
         } catch (err) {
-          const msg = `team:注入失败 ${(err as Error).message}`;
+          const reason = (err as Error).message;
+          const msg = `team:注入失败 ${reason}`;
           notes.push(msg);
           ctx.ui.notify(msg, "error");
+          // 发信人必须知道请求没进去,否则它会一直等回信
+          void notifyInjectFailure(String(it.from ?? ""), reason, ctx);
         }
         break;
       }
@@ -248,7 +297,8 @@ function connectWith(
   // 而 createTeam 写配置时恰好会留下 labels: []。
   if (config.labels?.length) state.selfLabels = config.labels;
   state.members = [];
-  state.pendingReply = null;
+  state.pendingReplies = [];
+  state.answering = [];
 
   // 模式解析优先级:环境变量 > 配置 > 默认 broker
   const resolved = resolveMode({ config });
@@ -439,12 +489,34 @@ export default function (pi: ExtensionAPI) {
   // 必须在这里攒。
   pi.on("message_end", async (event) => {
     const m = event.message as { role?: string; content?: unknown };
-    if (m?.role !== "assistant") return;
-    state.lastText = extractAssistantText(m.content);
+    const role = m?.role;
+
+    // user 消息也要看:注入的 payload 会原样出现在这里,靠它把
+    // "哪段回答对应哪个请求"绑起来。以前只处理 assistant,
+    // 所以并发请求时只能记住最后一个,回答会寄给错误的人。
+    if (role === "user" || role === "assistant") {
+      observeMessage(state, role, extractAssistantText(m.content));
+    }
+    if (role === "assistant") {
+      state.lastText = extractAssistantText(m.content);
+    }
+  });
+
+  pi.on("before_agent_start", async () => {
+    // run 真正开始,进入忙状态
+    runBusy = true;
+    injectedThisTick = true;
+  });
+
+  pi.on("agent_end", async () => {
+    runBusy = false;
+    injectedThisTick = false;
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
     ctxRef = ctx;
+    runBusy = false;
+    injectedThisTick = false;
     const actions = onTurnSettled(state);
     void runIntentions(actions as unknown as Array<Record<string, unknown>>, ctx);
   });

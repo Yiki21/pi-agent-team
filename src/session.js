@@ -30,6 +30,15 @@ const MAX_LABELS = 8;
 /** 已发出消息的记录上限,防止长会话内存增长 */
 const OUTBOUND_CAP = 1000;
 
+/**
+ * 待回复队列上限。
+ *
+ * 正常一次 settle 周期不会超过个位数。上限的作用是:万一 settle 永远不触发
+ * (Pi 卡死、异常退出),队列不能无限增长。超限时挤掉最早的那条并出失败卡片 ——
+ * 静默丢弃会让发信人一直等下去。
+ */
+const MAX_PENDING_REPLIES = 32;
+
 // ---------------------------------------------------------------- 类型
 
 /**
@@ -38,8 +47,12 @@ const OUTBOUND_CAP = 1000;
  * @typedef {{ seen: Set<string>, injected: Set<string>, outbound: Map<string, Outbound>,
  *             members: Member[], self: string, selfLabels: string[],
  *             announce: "off"|"auto"|"always",
- *             pendingReply: { to: string, hops: number, re: string }|null,
+ *             pendingReplies: PendingReply[], answering: PendingReply[],
+ *             lastRole: "user"|"assistant"|null,
  *             lastText: string }} SessionState
+ *
+ * @typedef {{ to: string, hops: number, re: string, payload: string,
+ *             bound: boolean, text: string|null }} PendingReply
  *
  * @typedef {{ type: "inject", payload: string, from: string }
  *   | { type: "card", kind: "receive"|"send"|"reply"|"failed"|"fyi", peer: string, text: string, reason?: string }
@@ -50,7 +63,11 @@ const OUTBOUND_CAP = 1000;
 
 // ---------------------------------------------------------------- 构造
 
-const newId = () => `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+/**
+ * 消息 id 生成。导出是因为 index.ts 也要造 id(注入失败通知),
+ * 两处各写一份迟早会分叉成不同格式。
+ */
+export const newId = () => `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
 export function createSessionState(self = "") {
   return {
@@ -62,7 +79,27 @@ export function createSessionState(self = "") {
     /** 本节点自己的标签。broker 需要它来解析 @label 群发。 */
     selfLabels: [],
     announce: "auto",
-    pendingReply: null,
+    /**
+     * 待自动回复的请求,按到达顺序。
+     *
+     * 以前是单槽,后到的覆盖先到的。实测(Pi 0.87)两条并发请求的事件序列:
+     *
+     *   agent_start
+     *     turn: user "请求 A" → assistant "对 A 的回答"
+     *     turn: user "请求 B" → assistant "对 B 的回答"     ← followUp 是新 turn
+     *   agent_end → agent_settled                           ← 只 settle 一次
+     *
+     * settle 时 lastText 已经是对 B 的回答。所以单槽的问题不只是"A 收不到",
+     * 天真地改成队列、把 lastText 发给所有人也不对 —— A 会收到答非所问的回复。
+     *
+     * 正确做法:每段 assistant 文本归属于它前面那条 user 消息。注入的 user
+     * 消息会原样出现在 message_end 里,按 payload 精确匹配就能绑定。
+     */
+    pendingReplies: [],
+    /** 当前 turn 正在回答的请求(可能不止一个:followUpMode=all 会把多条合进一个 turn) */
+    answering: [],
+    /** 上一条 user/assistant 消息的角色,用来判断连续的 user 消息是否同属一个 turn */
+    lastRole: null,
     lastText: "",
   };
 }
@@ -386,17 +423,39 @@ export function handleIncoming(s, env, now = Date.now()) {
   }
 
   const hops = typeof body.hops === "number" ? body.hops : 0;
+  const payload = buildPayload(env.from, text, cls);
+  const actions = [{ type: "card", kind: "receive", peer: env.from, text }];
+
   if (cls.autoReply) {
-    // 只有一个待回复槽。并发请求时后到的覆盖先到的 —— 这是已知缺陷,
-    // 见 roadmap 第 10 节"Known limitation"。抽出来测是为了让它的
-    // 行为明确,而不是偶尔被发现。
-    s.pendingReply = { to: env.from, hops, re: env.id };
+    // 有上限:settle 永远不来时(比如 Pi 卡死),队列不能无限增长。
+    // 挤掉的那条要说出来,不能静默丢。
+    if (s.pendingReplies.length >= MAX_PENDING_REPLIES) {
+      const dropped = s.pendingReplies.shift();
+      actions.push({
+        type: "card",
+        kind: "failed",
+        peer: dropped.to,
+        text: "",
+        reason: `待回复超过 ${MAX_PENDING_REPLIES} 条,${dropped.to} 的请求不会自动回复`,
+      });
+    }
+    // 同一个发信人只保留一条。
+    //
+    // 它连发三条时,三条都进了模型,但我们只该自动回一次 —— 否则
+    // 三个队友各发三条就会得到九条回信,而它们本来是一段回答。
+    //
+    // 保留最新的一条:回信带的 re 必须指向对端最近的那次请求,
+    // 它靠这个 id 把回信和自己的提问对上。
+    const existing = s.pendingReplies.findIndex((p) => p.to === env.from);
+    if (existing >= 0) s.pendingReplies.splice(existing, 1);
+
+    // payload 是之后在 message_end 里认出"这条 user 消息就是它"的依据,
+    // 所以必须和注入给 Pi 的字符串完全一致
+    s.pendingReplies.push({ to: env.from, hops, re: env.id, payload, bound: false, text: null });
   }
 
-  return [
-    { type: "card", kind: "receive", peer: env.from, text },
-    { type: "inject", payload: buildPayload(env.from, text, cls), from: env.from },
-  ];
+  actions.push({ type: "inject", payload, from: env.from });
+  return actions;
 }
 
 function describeUndeliverable(body) {
@@ -413,19 +472,59 @@ function describeUndeliverable(body) {
 // ---------------------------------------------------------------- 出站决策
 
 /**
+ * 观察一条消息,维护"哪段回答对应哪个请求"。
+ *
+ * 事件的真实形状(实测 Pi 0.87,两条并发请求):
+ *
+ *   agent_start
+ *     turn: user "A(I 注入的 payload)" → assistant "对 A 的回答"
+ *     turn: user "B(I 注入的 payload)" → assistant "对 B 的回答"   ← followUp 另起 turn
+ *   agent_end → agent_settled
+ *
+ * 所以有两条线索可以采用:
+ *   1. 注入的 user 消息会原样出现在这里,payload 能精确匹配到队列条目
+ *   2. 连续的 user 消息属于同一个 turn(followUpMode=all 时多条合入一个 turn),
+ *      而 turn 边界出现在 assistant 消息之后
+ */
+export function observeMessage(s, role, text) {
+  if (role === "user") {
+    // 匹配尚未绑定的队列条目
+    const hit = s.pendingReplies.find((p) => !p.bound && p.payload === text);
+    if (hit) {
+      hit.bound = true;
+      // 上一个角色也是 user,说明这是同一个 turn 里的第二条 payload,
+      // 两条共用接下来那段回答。否则是新 turn,清空交接。
+      if (s.lastRole !== "user") s.answering = [];
+      s.answering.push(hit);
+    }
+  } else if (role === "assistant") {
+    // 这段文本就是当前 turn 对所有待答请求的回答
+    for (const p of s.answering) p.text = text;
+    s.answering = [];
+  }
+  s.lastRole = role;
+}
+
+/**
  * 轮次结束后决定是否推送、推给谁。产出动作。
  *
  * 用 agent_settled 触发,不用 agent_end:后者之后还可能有重试、
  * compaction、queued continuation,拿它当"结束"会推中间态。
  */
 export function onTurnSettled(s) {
-  const text = s.lastText;
-  if (!text.trim()) return [];
+  if (s.announce === "off") {
+    s.pendingReplies = [];
+    s.answering = [];
+    s.lastText = "";
+    return [];
+  }
 
   if (s.announce === "always") {
+    const text = s.lastText;
+    if (!text.trim()) return [];
+    s.lastText = "";
     const list = others(s);
     if (list.length === 0) return [];
-    s.lastText = "";
     // fyi:true 让收件人只显示卡片,不叫醒它的模型。否则 N 个节点都开
     // always 时,每轮都会触发 N-1 轮新思考。
     return list.map((m) => ({
@@ -442,57 +541,78 @@ export function onTurnSettled(s) {
     }));
   }
 
-  if (s.announce === "auto") {
-    const reply = s.pendingReply;
-    s.pendingReply = null;
-    if (!reply) return [];
+  // auto:把每个待回复逐一送出去
+  const queue = s.pendingReplies;
+  s.pendingReplies = [];
+  s.answering = [];
+  if (queue.length === 0) return [];
 
-    s.lastText = "";
-    const hops = reply.hops + 1;
+  s.lastText = "";
+  const actions = [];
+  const online = new Set(others(s).map((m) => m.name));
 
-    // 对方可能在回信之前就下线了。这一轮仍值得留住文本,但不能假装发成功。
-    if (!others(s).some((m) => m.name === reply.to)) {
-      return [
-        { type: "card", kind: "failed", peer: reply.to, text, reason: `${reply.to} 已离线,回复没有送出` },
-      ];
+  for (const p of queue) {
+    // 没绑到回答文本,说明它的 user 消息没进模型,或者进了但这一轮没产出文字
+    // (注入被拒、被用户 Esc 中止、只调用了工具)。这时不能拿别的请求的回答
+    // 或 lastText 顶上 —— 那正是这次修复要消除的"答非所问"。
+    // 出失败卡片,让人看见这条请求没有被回复。
+    const text = p.text;
+    if (!text || !text.trim()) {
+      actions.push({
+        type: "card",
+        kind: "failed",
+        peer: p.to,
+        text: "",
+        reason: `${p.to} 的请求没有得到对应的回答,未自动回复`,
+      });
+      continue;
     }
 
+    // 对方可能在回信之前就下线了。
+    if (!online.has(p.to)) {
+      actions.push({
+        type: "card",
+        kind: "failed",
+        peer: p.to,
+        text,
+        reason: `${p.to} 已离线,回复没有送出`,
+      });
+      continue;
+    }
+
+    // 每条回复带自己的 re 和 hops —— 那是拓扑正确性,不能共用。
+    const hops = p.hops + 1;
     if (hops >= MAX_HOPS) {
-      return [
-        {
-          type: "send",
-          to: reply.to,
-          text,
-          hops,
-          re: reply.re,
-          origin: "model",
-          fyi: false,
-          id: newId(),
-          targets: [reply.to],
-          card: { kind: "send", peer: reply.to, text, reason: `已达跳数上限 ${MAX_HOPS},对端不会再回传` },
-        },
-      ];
-    }
-
-    return [
-      {
+      actions.push({
         type: "send",
-        to: reply.to,
+        to: p.to,
         text,
         hops,
-        re: reply.re,
+        re: p.re,
         origin: "model",
         fyi: false,
         id: newId(),
-        targets: [reply.to],
-        card: { kind: "reply", peer: reply.to, text },
-      },
-    ];
+        targets: [p.to],
+        card: { kind: "send", peer: p.to, text, reason: `已达跳数上限 ${MAX_HOPS},对端不会再回传` },
+      });
+      continue;
+    }
+
+    actions.push({
+      type: "send",
+      to: p.to,
+      text,
+      hops,
+      re: p.re,
+      origin: "model",
+      fyi: false,
+      id: newId(),
+      targets: [p.to],
+      card: { kind: "reply", peer: p.to, text },
+    });
   }
 
-  // off:清掉待回复,什么都不发
-  s.pendingReply = null;
-  return [];
+  return actions;
 }
 
 /** 从 assistant 消息里取文本 */

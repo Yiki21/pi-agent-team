@@ -6,7 +6,7 @@
  *
  *   1. broker 重启后重连(roster 重建)
  *   2. 对端在"请求发出"和"回复到达"之间离线
- *   3. 一轮内两个请求到达(已知缺陷:只有一个待回复槽)
+ *   3. 一轮内两个请求到达(并发请求各自收到自己的回答)
  *
  * 最后一组是对话形状回归,包括一个复现旧 bug 的对照组。
  */
@@ -22,6 +22,7 @@ import {
   extractText,
   handleIncoming,
   knownLabels,
+  observeMessage,
   onTurnSettled,
   others,
   parseRecipients,
@@ -39,6 +40,31 @@ const member = (name, over = {}) => ({
   labels: over.labels ?? [],
   since: over.since ?? 0,
 });
+
+/**
+ * 模拟 Pi 把一轮跑完,并喂给 observeMessage 的事件序列。
+ *
+ * 参数 turns 的形状是 [[请求 payload, 回答文本], ...],按实测的事件顺序:
+ *   user <payload> → assistant <回答>
+ * 连续两个 user 之间没有 assistant,说明它们在同一个 turn(followUpMode=all)。
+ */
+function runTurns(s, turns) {
+  for (const [payload, answer] of turns) {
+    observeMessage(s, "user", payload);
+    observeMessage(s, "assistant", answer);
+    s.lastText = answer;
+  }
+}
+
+/**
+ * 直接造一条待回复条目。
+ *
+ * 用于只关心"送出"逻辑的测试 —— 跳过注入和事件绑定那两步。
+ * text 为 null 表示还没绑定到回答。
+ */
+function pending(to, over = {}) {
+  return { to, hops: over.hops ?? 0, re: over.re ?? `req-${to}`, payload: over.payload ?? `payload-${to}`, bound: over.bound ?? true, text: over.text ?? "回答内容" };
+}
 
 /** 造一个已连上、roster 已填充的会话 */
 function session(self = "me", peers = [member("peer")], over = {}) {
@@ -90,7 +116,7 @@ test("knownLabels:汇总他人的 label,不含自己的", () => {
 
 test("缺口 1:broker 重启后 welcome 重建 roster", () => {
   const s = session("me", [member("old-peer")]);
-  s.pendingReply = { to: "old-peer", hops: 0, re: "x" };
+  s.pendingReplies = [pending("old-peer")];
 
   // broker 重启:连接断开 → 客户端清空视图 → 重连收到新 welcome
   s.members = [];
@@ -125,9 +151,9 @@ test("缺口 1:重启后到达的回复,原消息未知 → 注入但不自动�
   assert.equal(cls.original, null);
 });
 
-test("缺口 1:重启后 pendingReply 失效,settled 时不误发", () => {
+test("缺口 1:重启后待回复失效,settled 时不误发", () => {
   const s = session("me", []);
-  s.pendingReply = { to: "gone-peer", hops: 0, re: "x" };
+  s.pendingReplies = [pending("gone-peer", { text: "想回的答复" })];
   s.lastText = "想回的答复";
 
   const actions = onTurnSettled(s);
@@ -140,7 +166,7 @@ test("缺口 1:重启后 pendingReply 失效,settled 时不误发", () => {
 
 test("缺口 2:请求发出后对端离线,回信失败并出 fail 卡片", () => {
   const s = session("me", [member("peer")]);
-  s.pendingReply = { to: "peer", hops: 0, re: "req-1" };
+  s.pendingReplies = [pending("peer", { re: "req-1", text: "答复内容" })];
   s.lastText = "答复内容";
 
   // 对端掉线,roster 更新
@@ -151,13 +177,13 @@ test("缺口 2:请求发出后对端离线,回信失败并出 fail 卡片", () =
   assert.equal(actions[0].type, "card");
   assert.equal(actions[0].kind, "failed");
   assert.match(actions[0].reason, /peer 已离线/);
-  assert.equal(s.pendingReply, null, "失败后待回复槽应清空");
+  assert.equal(s.pendingReplies.length, 0, "失败后待回复队列应清空");
   assert.equal(s.lastText, "", "文本已消费,不该在下轮重复推");
 });
 
 test("缺口 2:对端在线时正常回信,带 re 且跳数 +1", () => {
   const s = session("me", [member("peer")]);
-  s.pendingReply = { to: "peer", hops: 1, re: "req-1" };
+  s.pendingReplies = [pending("peer", { hops: 1, re: "req-1", text: "答复" })];
   s.lastText = "答复";
 
   const [action] = onTurnSettled(s);
@@ -176,28 +202,119 @@ test("缺口 2:没有待回复时 settled 不发任何东西", () => {
 
 // ================================================================ 缺口 3:并发请求
 
-test("缺口 3:一轮内两个请求,当前只有一个待回复槽(已知缺陷)", () => {
+test("缺口 3:同一轮两个请求,各自拿到自己的回答", () => {
   const s = session("me", [member("a"), member("b")]);
 
-  const a1 = handleIncoming(s, { from: "a", id: "req-a", re: null, body: { text: "来自 a" } });
-  const first = { ...s.pendingReply };
-  assert.equal(first.to, "a");
-  assert.ok(types(a1).includes("inject"), "a 的请求仍然注入模型");
+  // 两个队友几乎同时发来请求。第二条到达时 run 已在进行中,
+  // 所以它走 followUp —— Pi 会给它单独一个 turn。
+  const na = handleIncoming(s, { from: "a", id: "req-a", re: null, body: { text: "来自 a" } });
+  const nb = handleIncoming(s, { from: "b", id: "req-b", re: null, body: { text: "来自 b" } });
 
-  const a2 = handleIncoming(s, { from: "b", id: "req-b", re: null, body: { text: "来自 b" } });
-  assert.ok(types(a2).includes("inject"), "b 的请求也注入模型");
+  assert.equal(s.pendingReplies.length, 2, "两条请求都进了队列,没有互相覆盖");
+  const payloadA = na.find((x) => x.type === "inject").payload;
+  const payloadB = nb.find((x) => x.type === "inject").payload;
 
-  assert.equal(s.pendingReply.to, "b", "后到的覆盖先到的 —— 这就是已知缺陷");
-  assert.notDeepEqual(s.pendingReply, first, "a 的待回复被挤掉了");
+  // Pi 实际跑出的形状:两个 turn,每个 turn 一条 user + 一条 assistant
+  runTurns(s, [
+    [payloadA, "回答给 a"],
+    [payloadB, "回答给 b"],
+  ]);
 
-  // 模型这一轮同时处理了两条注入,产出一段文本
-  s.lastText = "综合两条的回答";
+  const sends = onTurnSettled(s).filter((x) => x.type === "send");
+  assert.equal(sends.length, 2, "两个发信人都要收到回信");
+
+  const byTo = Object.fromEntries(sends.map((x) => [x.to, x]));
+  assert.equal(byTo.a.text, "回答给 a", "a 必须收到回答 a 的那段文本");
+  assert.equal(byTo.b.text, "回答给 b", "b 必须收到回答 b 的那段文本");
+  assert.equal(byTo.a.re, "req-a", "每条回复关联自己的请求 id");
+  assert.equal(byTo.b.re, "req-b");
+});
+
+test("缺口 3:followUpMode=all 把多条注入合进一个 turn,共用那段回答", () => {
+  const s = session("me", [member("a"), member("b")]);
+
+  const na = handleIncoming(s, { from: "a", id: "req-a", re: null, body: { text: "来自 a" } });
+  const nb = handleIncoming(s, { from: "b", id: "req-b", re: null, body: { text: "来自 b" } });
+  const payloadA = na.find((x) => x.type === "inject").payload;
+  const payloadB = nb.find((x) => x.type === "inject").payload;
+
+  // 连续两条 user 之后才出现 assistant —— 模型同时看到了两条输入
+  observeMessage(s, "user", payloadA);
+  observeMessage(s, "user", payloadB);
+  observeMessage(s, "assistant", "一次性回答了两条");
+  s.lastText = "一次性回答了两条";
+
+  const sends = onTurnSettled(s).filter((x) => x.type === "send");
+  assert.equal(sends.length, 2);
+  for (const x of sends) assert.equal(x.text, "一次性回答了两条", "同 turn 的两条共用同一段回答");
+  assert.deepEqual(sends.map((x) => x.re).sort(), ["req-a", "req-b"]);
+});
+
+test("缺口 3:同一发信人连发多条,只自动回复一次", () => {
+  const s = session("me", [member("a")]);
+
+  for (const id of ["r1", "r2", "r3"]) {
+    handleIncoming(s, { from: "a", id, re: null, body: { text: `第 ${id} 条` } });
+  }
+  assert.equal(s.pendingReplies.length, 1, "同一个发信人只保留一条待回复");
+
+  // 三条 user 都进了模型,但只有最后一条 payload 在队列里
+  runTurns(s, [[s.pendingReplies[0].payload, "一起答了"]]);
+
+  const sends = onTurnSettled(s).filter((x) => x.type === "send");
+  assert.equal(sends.length, 1, "不该为同一个发信人产生三条回信");
+  assert.equal(sends[0].to, "a");
+});
+
+test("缺口 3:请求没进模型时出失败卡片,不拿别的回答顶上", () => {
+  const s = session("me", [member("a"), member("b")]);
+
+  const na = handleIncoming(s, { from: "a", id: "req-a", re: null, body: { text: "来自 a" } });
+  handleIncoming(s, { from: "b", id: "req-b", re: null, body: { text: "来自 b" } });
+
+  // 只有 a 的 payload 进了模型(比如 b 那条注入被 Pi 拒绝)
+  const payloadA = na.find((x) => x.type === "inject").payload;
+  runTurns(s, [[payloadA, "只回答了 a"]]);
+
   const actions = onTurnSettled(s);
-
   const sends = actions.filter((x) => x.type === "send");
-  assert.equal(sends.length, 1, "只能发一条自动回信");
-  assert.equal(sends[0].to, "b", "只有 b 拿到自动回信");
-  assert.equal(sends[0].re, "req-b", "回信关联的是最后那条请求");
+  const fails = actions.filter((x) => x.type === "card" && x.kind === "failed");
+
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].to, "a");
+  assert.equal(fails.length, 1, "b 要看到失败,而不是收到 a 的回答");
+  assert.equal(fails[0].peer, "b");
+  assert.match(fails[0].reason, /没有.*回答|未自动回复/);
+});
+
+test("缺口 3:settle 之后队列清空,下一轮不重复发", () => {
+  const s = session("me", [member("a")]);
+  const n = handleIncoming(s, { from: "a", id: "req-a", re: null, body: { text: "来自 a" } });
+  runTurns(s, [[n.find((x) => x.type === "inject").payload, "回答"]]);
+
+  assert.equal(onTurnSettled(s).filter((x) => x.type === "send").length, 1);
+  assert.equal(s.pendingReplies.length, 0, "队列应清空");
+  assert.deepEqual(onTurnSettled(s), [], "再 settle 不该重复发");
+});
+
+test("缺口 3:announce=off 时队列直接清掉,不发也不留", () => {
+  const s = session("me", [member("a")], { announce: "off" });
+  handleIncoming(s, { from: "a", id: "req-a", re: null, body: { text: "来自 a" } });
+  assert.equal(s.pendingReplies.length, 1);
+
+  assert.deepEqual(onTurnSettled(s), []);
+  assert.equal(s.pendingReplies.length, 0);
+});
+
+test("缺口 3:队列有上限,超出的出失败卡片而不是静默丢弃", () => {
+  const peers = Array.from({ length: 40 }, (_, i) => member(`p${i}`));
+  const s = session("me", peers);
+
+  for (let i = 0; i < 40; i++) {
+    handleIncoming(s, { from: `p${i}`, id: `req-${i}`, re: null, body: { text: `来自 p${i}` } });
+  }
+
+  assert.ok(s.pendingReplies.length <= 32, `队列不应超过上限,实际 ${s.pendingReplies.length}`);
 });
 
 test("缺口 3:重复投递同一 id 只注入一次", () => {
@@ -285,7 +402,7 @@ test("对话形状:我们发出的消息被别人回复 → 注入、不回信",
   assert.equal(cls.original, "原始提问");
 
   const actions = handleIncoming(s, { from: "peer", id: "r-1", re: id, body: { text: "答复" } });
-  assert.equal(s.pendingReply, null, "回复不该设置待回复槽");
+  assert.equal(s.pendingReplies.length, 0, "回复不该设置待回复");
   assert.ok(types(actions).includes("inject"));
 });
 
@@ -310,7 +427,9 @@ test("对话形状:新请求 → 卡片 + 注入 + 设置待回复", () => {
 
   assert.deepEqual(types(actions), ["card", "inject"]);
   assert.match(actions[1].payload, /\[来自 peer 的 team 消息\]/);
-  assert.equal(s.pendingReply.re, "req-x", "re 指向入站消息 id,用于回信时闭合");
+  assert.equal(s.pendingReplies.length, 1);
+  assert.equal(s.pendingReplies[0].re, "req-x", "re 指向入站消息 id,用于回信时闭合");
+  assert.equal(s.pendingReplies[0].payload, actions[1].payload, "入队的 payload 必须和注入给 Pi 的完全一致,否则绑不上回答");
 });
 
 test("对话形状:fyi 广播只出卡片", () => {
@@ -318,7 +437,7 @@ test("对话形状:fyi 广播只出卡片", () => {
   const actions = handleIncoming(s, { from: "peer", id: "fyi-1", re: null, body: { text: "状态", fyi: true } });
 
   assert.deepEqual(types(actions), ["card"]);
-  assert.equal(s.pendingReply, null);
+  assert.equal(s.pendingReplies.length, 0, "fyi 不该产生待回复");
   assert.equal(s.lastText, "", "fyi 不该写入待推文本");
 });
 
@@ -356,9 +475,16 @@ test("对话形状回归:旧行为(回复也自动回信)会打到跳数上限",
     for (let i = 0; i < wire.length && i < 20; i++) {
       const msg = wire[i];
       const receiver = nodes[msg.to];
-      handleIncoming(receiver, msg.env);
+      const actions = handleIncoming(receiver, msg.env);
 
+      // 按 Pi 实际发出的事件模拟:注入的 payload 以 user 消息出现,
+      // 随后才是 assistant 的回答。旧写法直接赋 lastText,跳过了绑定,
+      // 会让这个对照组测不到真实路径。
+      const injected = actions.find((a) => a.type === "inject");
+      if (injected) observeMessage(receiver, "user", injected.payload);
+      observeMessage(receiver, "assistant", `answer-${i}`);
       receiver.lastText = `answer-${i}`;
+
       for (const a of onTurnSettled(receiver)) {
         if (a.type === "send") {
           wire.push({
@@ -461,7 +587,7 @@ test("@label 群发能命中经 tags 映射来的节点", () => {
  */
 test("契约:onTurnSettled 的 send 意图在顶层带 text 和 hops", () => {
   const s = session("me", [member("peer")]);
-  s.pendingReply = { to: "peer", hops: 0, re: "req-1" };
+  s.pendingReplies = [pending("peer", { re: "req-1", text: "回复内容" })];
   s.lastText = "回复内容";
 
   const [send] = onTurnSettled(s);
@@ -501,7 +627,7 @@ test("契约:所有 send 意图都不使用 body 字段(由调用方组装)", ()
   const s = session("me", [member("peer")]);
   s.lastText = "x";
 
-  const fromSettled = onTurnSettled({ ...s, pendingReply: { to: "peer", hops: 0, re: "r" } });
+  const fromSettled = onTurnSettled({ ...s, pendingReplies: [pending("peer", { text: "x" })] });
   const fromSend = sendMessage(s, { to: "peer", text: "y", origin: "user" });
 
   for (const a of [...fromSettled, ...fromSend].filter((x) => x.type === "send")) {

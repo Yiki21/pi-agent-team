@@ -409,7 +409,7 @@ test("契约:两个生产者的 send 意图字段集一致", async () => {
 
   const s = createSessionState("me");
   applyRoster(s, { members: [{ name: "me", labels: [], host: null, addr: null, since: 0 }, { name: "peer", labels: [], host: null, addr: null, since: 0 }] });
-  s.pendingReply = { to: "peer", hops: 0, re: "r1" };
+  s.pendingReplies = [{ to: "peer", hops: 0, re: "r1", payload: "p", bound: true, text: "y" }];
   s.lastText = "y";
   const fromSession = onTurnSettled(s).find((i) => i.type === "send");
 
