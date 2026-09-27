@@ -198,18 +198,20 @@ Health check: `curl http://<tailnet-ip>:8787/health`
 ```bash
 TEAM_URL=ws://<tailnet-ip>:8787 \
 TEAM_NAME=laptop-web \
-TEAM_TAGS=web,frontend \
+TEAM_LABELS=web,frontend \
 TEAM_TOKEN=<the token> \
   pi --extension /path/to/pi-agent-team/index.ts
 ```
 
-`TEAM_NAME` must be unique across the team. `TEAM_TAGS` is optional and used for
-group sends. Multiple PIs on one machine just need different names.
+`TEAM_NAME` must be unique across the team. `TEAM_LABELS` is optional and used
+for group sends (`@web`). Multiple PIs on one machine just need different names.
 
 Or install as a Pi package:
 
 ```bash
-pi install git:github.com/Yiki21/pi-agent-team
+pi install npm:@yiki21/pi-agent-team        # from npm
+# or
+pi install git:github.com/Yiki21/pi-agent-team   # from GitHub
 ```
 
 ### 3. Verify

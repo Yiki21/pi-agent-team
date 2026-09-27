@@ -1,5 +1,5 @@
 {
-  "name": "pi-agent-team",
+  "name": "@yiki21/pi-agent-team",
   "version": "0.1.0",
   "description": "Turn several machines running the Pi coding agent into one team over your tailnet. Three transports (broker / mesh / SWIM), one shared API and conformance suite.",
   "license": "MIT",
@@ -63,5 +63,11 @@
   "bugs": {
     "url": "https://github.com/Yiki21/pi-agent-team/issues"
   },
-  "homepage": "https://github.com/Yiki21/pi-agent-team#readme"
+  "homepage": "https://github.com/Yiki21/pi-agent-team#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@yiki21/pi-agent-team": "^0.1.0"
+  }
 }
