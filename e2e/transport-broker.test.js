@@ -143,13 +143,19 @@ async function brokerHarness(t, { noTakeover = false } = {}) {
         n.stop();
       } catch {}
     }
+    // 已经退出的进程不会再发 exit —— 这时 once() 会永远等下去。
+    // killBroker() 之后就是这种情况。
+    if (broker.exitCode !== null || broker.signalCode !== null) return;
     broker.kill("SIGTERM");
     await once(broker, "exit").catch(() => {});
   };
 
   t.after(teardown);
 
-  return { url, create, teardown };
+  /** 模拟 broker 崩溃 / 网络断开 —— 已连上的节点会看到连接断掉 */
+  const killBroker = () => broker.kill("SIGKILL");
+
+  return { url, create, teardown, killBroker };
 }
 
 // ---------------------------------------------------------------- 跑套件
@@ -188,4 +194,79 @@ test("[broker] 未配置 token 时连接失败", async (t) => {
   await new Promise((r) => setTimeout(r, 600));
   bad.stop();
   assert.ok(states.length > 0, "应有状态变化");
+});
+
+// ---------------------------------------------------------------- token 不匹配的诊断
+//
+// 这组测试针对一个真实症状:token 写错时,用户看到的是"连不上",
+// 于是去查网络、地址、防火墙 —— 而真正的问题是凭据。
+//
+// 根因是 Node 内置 WebSocket 把握手阶段的 401 藏成了 "error + close 1006",
+// 和网络断开完全无法区分(实测确认)。
+
+test("[broker] token 不对:状态变成 auth_failed 并停止重连", async (t) => {
+  // harness 返回 { url, create, teardown } —— 没有 port。
+  // 之前这里解构了 port,于是 url 是 undefined,等于在测一个连不上的地址。
+  const { url } = await brokerHarness(t);
+
+  const states = [];
+  const details = [];
+  const transport = createBrokerTransport({ url, token: "definitely-not-the-token" });
+  t.after(() => transport.stop());
+
+  transport.on("state", (s, d) => {
+    states.push(s);
+    if (d) details.push({ s, d });
+  });
+
+  // 必须启动,否则状态机根本没跑 —— 之前漏了这一行,测试只等到超时。
+  transport.start({ name: "auth-wrong", labels: [], host: null });
+
+  await waitFor(() => transport.state() === "auth_failed", 12000, "进入 auth_failed");
+
+  assert.equal(transport.state(), "auth_failed", "应停下并报凭据问题");
+
+  const d = details.find((x) => x.s === "auth_failed").d;
+  assert.equal(d.reason, "mismatch");
+  assert.match(d.fingerprint, /^[0-9a-f]{8}$/, "要带上 broker 的指纹,便于用户比对");
+  assert.equal(typeof d.url, "string");
+
+  // 关键:不该继续无限重连。等一会儿确认状态稳定且没有新的 connecting。
+  const before = states.length;
+  await new Promise((r) => setTimeout(r, 3000));
+  assert.equal(states.length, before, "不该再产生新状态 —— 重连多少次也不会变对");
+  assert.equal(states.includes("online"), false, "从未连上过");
+});
+
+test("[broker] token 正确:不进入 auth_failed", async (t) => {
+  const h = await brokerHarness(t);
+  const a = await h.create({ name: "auth-ok", labels: [] });
+
+  await waitFor(() => a.transport.state() === "online", 8000, "正常上线");
+  assert.equal(a.transport.state(), "online");
+  assert.equal(
+    a.states.includes("auth_failed"),
+    false,
+    "token 对的时候不该误报凭据问题",
+  );
+});
+
+test("[broker] 连上过再断开,不误判成 token 问题", async (t) => {
+  const h = await brokerHarness(t);
+  const a = await h.create({ name: "auth-flap", labels: [] });
+  await waitFor(() => a.transport.state() === "online", 8000, "先上线");
+
+  // 网络层面的断开:杀掉 broker,让连接断掉。
+  // token 显然是对的(否则当初连不上),所以不该走 auth_failed 分支。
+  //
+  // 之前这里调的是 _debugDropSocket?.() —— 一个不存在的方法。
+  // 可选链让它静默成功,断言因为状态没变而通过,等于什么都没测。
+  h.killBroker();
+  await new Promise((r) => setTimeout(r, 2500));
+
+  assert.notEqual(
+    a.transport.state(),
+    "auth_failed",
+    "连上过就说明 token 是对的,断开属于网络波动",
+  );
 });

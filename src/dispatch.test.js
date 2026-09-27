@@ -262,17 +262,28 @@ test("create:生成配置并产出 connect party", (t) => {
   const c = setup();
   const bad = run("create", [], c);
   assert.equal(bad.ok, false);
-  assert.match(bad.error, /用法/);
+  assert.match(bad.error, /缺少 team 名/);
 
   const badUrl = run("create", ["t1", "not-a-url"], c);
   assert.equal(badUrl.ok, false);
 });
 
-test("join:缺 team 名时报用法", () => {
+test("join:缺 team 名时说清缺的是什么", () => {
   const c = setup();
   const r = run("join", [], c);
   assert.equal(r.ok, false);
-  assert.match(r.error, /用法/);
+  assert.match(r.error, /缺少 team 名/);
+});
+
+test("join:给了选项却没给 team 名 —— 最容易犯的错,要针对性提示", () => {
+  // 真实反馈:用户敲 `/team join --url ... --token ...`,该给的看起来
+  // 都给了,所以读"用法"那张选项表找不出错在哪。漏的是最前面的位置参数。
+  const c = setup();
+  const r = run("join", ["--url", "http://h:1", "--token", TOKEN64], c);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /缺少 team 名/);
+  assert.match(r.error, /--url/, "要点出他确实给了哪些选项");
+  assert.match(r.error, /<team名>/, "要给出正确写法");
 });
 
 test("leave:没有当前 team 时报用法", () => {
@@ -537,7 +548,7 @@ test("create:支持 --mode/--seeds,并给出其它机器的加入命令", async 
   const r = run("create", ["t8", "--mode", "mesh", "--seeds", "10.0.0.1:19801"], c);
   assert.equal(r.ok, true, r.error);
   assert.equal(r.party.config.mode, "mesh");
-  const joinLine = r.lines.find((l) => l.startsWith("/team join"));
+  const joinLine = r.lines.find((l) => l.trim().startsWith("/team join"));
   assert.ok(joinLine, "要给出别的机器怎么加入");
   assert.match(joinLine, /--mode mesh/, "加入命令必须带上模式,否则对方会按 broker 连");
 });

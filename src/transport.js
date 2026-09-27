@@ -8,7 +8,7 @@
  *   start(self)            连接并加入
  *   stop()                 离开并断开
  *   send(envelope)         投递,返回是否进入了发送路径
- *   state()                "offline" | "connecting" | "online" | "replaced"
+ *   state()                "offline" | "connecting" | "online" | "replaced" | "auth_failed"
  *   members()              当前成员视图 [{name, host, labels, endpoints}]
  *   on("envelope", fn)     收到应用消息或控制消息
  *   on("state", fn)        连接状态变化
@@ -24,6 +24,44 @@
 
 /** broker 用这个关闭码表示"你被同名的新连接顶掉了"。 */
 export const CLOSE_REPLACED = 4001;
+
+/**
+ * 握手失败后探测 token 是否正确。
+ *
+ * ── 为什么需要这一步 ──
+ * Node 内置 WebSocket 把握手阶段的 HTTP 状态完全藏起来了。实测:broker
+ * 返回 401 时,客户端只拿到 error(消息为空)+ close 1006 —— 和网线被拔
+ * 一模一样,无法区分。所以连不上时用普通 HTTP 问一次 broker。
+ *
+ * 返回:
+ *   "mismatch"   token 不对(带服务端指纹)
+ *   "missing"    没带 token
+ *   "ok"         token 是对的,问题在别处(网络、地址)
+ *   null         探不到(网络不通、不是本项目的 broker)
+ *
+ * 探测失败一律当作 null:不能因为诊断接口不可用就误判成 token 错误。
+ */
+export async function probeAuth(url, token, timeoutMs = 4000) {
+  const base = url.replace(/^ws:/, "http:").replace(/^wss:/, "https:").replace(/\/$/, "");
+  try {
+    const res = await fetch(`${base}/auth`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (res.status === 200) return { verdict: "ok" };
+    let body = null;
+    try {
+      body = await res.json();
+    } catch {}
+    if (body?.reason === "token_missing") return { verdict: "missing" };
+    if (body?.reason === "token_mismatch") return { verdict: "mismatch", fingerprint: body.fingerprint ?? null };
+    // 401 但格式不认识,仍按 token 问题处理
+    if (res.status === 401) return { verdict: "mismatch", fingerprint: null };
+    return { verdict: "ok" };
+  } catch {
+    return null;
+  }
+}
 
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
@@ -77,6 +115,8 @@ export function createBrokerTransport({ url, token, WebSocketImpl = WebSocket })
   const bus = createEmitter();
   /** @type {WebSocket|null} */
   let socket = null;
+  /** 是否成功连上过 —— 用来区分"token 不对"和"连上后网络断了" */
+  let everOnline = false;
   let state = "offline";
   let self = null;
   let members = [];
@@ -144,6 +184,7 @@ export function createBrokerTransport({ url, token, WebSocketImpl = WebSocket })
 
     ws.addEventListener("open", () => {
       reconnectDelay = RECONNECT_BASE_MS;
+      everOnline = true;
       setState("online");
     });
 
@@ -171,9 +212,46 @@ export function createBrokerTransport({ url, token, WebSocketImpl = WebSocket })
         return;
       }
 
+      // 从未连上过就断开,很可能是 token 不对。
+      //
+      // 为什么要单独探测:内置 WebSocket 把握手阶段的 401 藏成了
+      // "error + 1006",和网络断开无法区分,用户看到的是"连不上",
+      // 会去查网络和地址,而真正的问题是 token。
+      //
+      // 只在从未连上过时探:连上过又断开属于网络波动,token 显然是对的
+      // (否则当初也连不上),那时探测只会拖慢重连。
+      if (!everOnline && !stopped) {
+        void classifyFailure(ev.code);
+        return;
+      }
+
       setState("offline", { code: ev.code });
       scheduleReconnect();
     });
+
+    /**
+     * 握手失败后判因。token 不对就停下并报错 —— 重连多少次也不会变对,
+     * 只会刷屏。其余情况照旧重连。
+     */
+    async function classifyFailure(code) {
+      const verdict = await probeAuth(url, token);
+
+      // 探测期间用户可能已经手动断开或换配置了
+      if (stopped || socket) return;
+
+      if (verdict?.verdict === "mismatch" || verdict?.verdict === "missing") {
+        stopped = true;
+        setState("auth_failed", {
+          reason: verdict.verdict,
+          fingerprint: verdict.fingerprint ?? null,
+          url,
+        });
+        return;
+      }
+
+      setState("offline", { code, probe: verdict?.verdict ?? "unreachable" });
+      scheduleReconnect();
+    }
 
     // error 之后必然跟 close,重连统一放在 close 里处理
     ws.addEventListener("error", () => {});

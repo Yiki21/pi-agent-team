@@ -25,12 +25,14 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
+import { createHash } from "node:crypto";
 import { hostname } from "node:os";
 import { Type } from "typebox";
 
 import { createBrokerTransport, CLOSE_REPLACED } from "./src/transport.js";
 import { MODES, createTransport, modeReadiness, normalizeSeeds, resolveMode } from "./src/mode.js";
 import { createSessionState, handleIncoming, knownLabels, newId, onTurnSettled, observeMessage, others, teamSize, applyRoster } from "./src/session.js";
+import { createInjectState, onInject, onRunStart, onSettled } from "./src/inject-queue.js";
 import { createTeam, joinTeam, leaveTeam, listTeams, readTeam, toSocketUrl } from "./src/team-config.js";
 import { BULK_WARN_THRESHOLD, dispatch, doSend, sendMessage } from "./src/dispatch.js";
 
@@ -42,7 +44,7 @@ type CardDetails = { kind: CardKind; peer: string; text: string; at: number; rea
 
 const CARD_TYPE = "team-message";
 
-type ConnState = "offline" | "connecting" | "online" | "replaced";
+type ConnState = "offline" | "connecting" | "online" | "replaced" | "auth_failed";
 
 // ---------------------------------------------------------------- 运行时
 
@@ -63,19 +65,13 @@ let ctxRef: ExtensionContext | null = null;
 let apiRef: ExtensionAPI | null = null;
 
 /**
- * 当前 run 是否在处理中。
+ * 注入时机状态。规则和实测依据见 src/inject-queue.js。
  *
- * 不能用 ctx.isIdle() 判断。实测两条背靠背注入时,它在同一 tick 里
- * 两次都返回 true,于是第二条走"直发"路径,被 Pi 以
- * "Agent is already processing a prompt" 拒绝 —— 请求整个丢失,
- * 比"只回最后一个"严重得多。
- *
- * 所以自己维护:注入后立刻置忙,agent_settled 时置闲。
+ * 简单说:第一条直发(由它开始一个 run),接下来的先排队,等
+ * agent_start 到了再逐条以 followUp 投出。直接在同一个 tick 里连发
+ * 多条会让后面的被覆盖 —— 而且调用还返回成功。
  */
-let runBusy = false;
-
-/** 同 tick 连续注入的防重入 —— 第一条发出后马上置位,不等事件回调 */
-let injectedThisTick = false;
+let injectState = createInjectState();
 
 /** dispatch 需要的环境快照 */
 const envOf = () => ({
@@ -171,14 +167,15 @@ async function runIntentions(
 
       case "inject": {
         const payload = String(it.payload);
+        const { state: next, mode } = onInject(injectState, payload);
+        injectState = next;
+
+        // 排队的那条要等 agent_start,这里不能算"已送达"
+        if (mode === "queued") break;
+
         try {
-          // 用自维护的忙标志,不用 ctx.isIdle()
-          if (!runBusy && !injectedThisTick) {
-            apiRef?.sendUserMessage(payload);
-          } else {
-            apiRef?.sendUserMessage(payload, { deliverAs: "followUp" });
-          }
-          injectedThisTick = true;
+          if (mode === "followUp") apiRef?.sendUserMessage(payload, { deliverAs: "followUp" });
+          else apiRef?.sendUserMessage(payload);
         } catch (err) {
           const reason = (err as Error).message;
           const msg = `team:注入失败 ${reason}`;
@@ -282,8 +279,45 @@ function renderStatus() {
     ui.setStatus("team", `⚠️ team:${state.self || "?"} (被顶替)`);
     return;
   }
-  const icon = connState === "online" ? "🟢" : connState === "connecting" ? "🟡" : "🔴";
+  const icon =
+    connState === "online"
+      ? "🟢"
+      : connState === "connecting"
+        ? "🟡"
+        : connState === "auth_failed"
+          ? "🔑" // 和"网络断开"区分开:这是凭据问题,不是网络问题
+          : "🔴";
   ui.setStatus("team", `${icon} team:${state.self || "?"} (${teamSize(state)}) ${currentMode}`);
+}
+
+/**
+ * token 不对时的提示。
+ *
+ * 要把两边的指纹都给出来:用户看到的现象是"连不上",最先怀疑的是
+ * 网络和地址。指纹一比对,马上就能确认是 token 不一致,而且知道
+ * 该改哪一边 —— 指纹不是 token 本身,贴出来也不泄露什么。
+ */
+function tokenFailureMessage(detail: { reason?: string; fingerprint?: string | null; url?: string }): string {
+  const mine = currentConfig?.token ? fingerprintOf(currentConfig.token) : "(无)";
+  if (detail.reason === "missing") {
+    return "team:broker 拒绝连接 —— 没有提供 token。用 /team join <team> --token <token> 补上。";
+  }
+  const lines = [
+    `team:broker 拒绝了这个 token(${detail.url ?? "broker"})。已停止重连 —— 重试多少次也不会变对。`,
+    "",
+    `  本机 token 指纹:  ${mine}`,
+    `  broker token 指纹:${detail.fingerprint ?? "(未知)"}`,
+    "",
+    "两个指纹不同,说明本机和 broker 用的不是同一个 token。",
+    "broker 启动时打印过它的指纹;改其中一边让它们一致:",
+    "  /team join <team> --token <broker 的 token>",
+  ];
+  return lines.join("\n");
+}
+
+/** 与 broker 相同的指纹算法:sha256 前 8 位 */
+function fingerprintOf(token: string): string {
+  return createHash("sha256").update(token).digest("hex").slice(0, 8);
 }
 
 // ---------------------------------------------------------------- 连接
@@ -364,6 +398,8 @@ function connectWith(
         `team:节点名 "${state.self}" 已被另一个实例接管,本实例停止重连。换一个名字,或关掉那个实例。`,
         "error",
       );
+    } else if (next === "auth_failed") {
+      ctxRef?.ui.notify(tokenFailureMessage(detail as { reason?: string; fingerprint?: string | null; url?: string }), "error");
     } else if (next === "offline" && (detail as { code?: number })?.code === CLOSE_REPLACED) {
       ctxRef?.ui.notify("team:连接被同名实例顶替", "warning");
     }
@@ -527,21 +563,27 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("before_agent_start", async () => {
-    // run 真正开始,进入忙状态
-    runBusy = true;
-    injectedThisTick = true;
-  });
-
-  pi.on("agent_end", async () => {
-    runBusy = false;
-    injectedThisTick = false;
+  // run 正式开始 —— 这时才把排队的消息投出去。
+  //
+  // 为什么必须等这一刻:agent_start 之前投 followUp 没有意义,那时代理
+  // 还没开始处理,Pi 会把它当普通 prompt,于是又落回"被后一条覆盖"的
+  // 那个窗口。探针在 before_agent_start 与 agent_start 之间实测过。
+  pi.on("agent_start", async () => {
+    const { state, flush } = onRunStart(injectState);
+    injectState = state;
+    for (const payload of flush) {
+      try {
+        apiRef?.sendUserMessage(payload, { deliverAs: "followUp" });
+      } catch (err) {
+        const reason = (err as Error).message;
+        ctxRef?.ui.notify(`team:排队消息注入失败 ${reason}`, "error");
+      }
+    }
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
     ctxRef = ctx;
-    runBusy = false;
-    injectedThisTick = false;
+    injectState = onSettled(injectState);
     const actions = onTurnSettled(state);
     void runIntentions(actions as unknown as Array<Record<string, unknown>>, ctx);
   });
@@ -1150,7 +1192,7 @@ export default function (pi: ExtensionAPI) {
             const tokenLine = r.lines.find((l) => /^[0-9a-f]{64}$/.test(l));
             ctx.ui.notify(
               tokenLine
-                ? `team "${args[0]}" 已创建并连接。\n\ntoken(只显示这一次,也在配置文件里):\n${tokenLine}\n\n${r.lines.find((l) => l.startsWith("/team join")) ?? ""}`
+                ? `team "${args[0]}" 已创建并连接。\n\ntoken(只显示这一次,也在配置文件里):\n${tokenLine}\n\n${r.lines.find((l) => l.trim().startsWith("/team join"))?.trim() ?? ""}`
                 : r.lines.join("\n"),
               "info",
             );

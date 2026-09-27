@@ -192,6 +192,40 @@ function peersResult(state) {
 
 // ---------------------------------------------------------------- team 生命周期
 
+/**
+ * 缺 team 名时的提示。
+ *
+ * 以前只报一句"用法:…"加一张选项表。用户给齐了 --url 和 --token,
+ * 看起来该给的都给了,所以读那张表找不出错在哪 —— 实际上漏的是
+ * 最前面那个位置参数。这里把"缺的是什么"说在第一行。
+ */
+function missingTeamName(sub, parsed) {
+  const given = Object.keys(parsed.values);
+  const lines = [];
+
+  if (given.length) {
+    // 给了选项但没给名字:这是最容易犯的错,要直接点出来
+    lines.push(
+      `缺少 team 名。你给了 ${given.map((k) => `--${k}`).join(" ")},但 team 名要放在最前面:`,
+      "",
+      `  /team ${sub} <team名> ${given.map((k) => `--${k} …`).join(" ")}`,
+    );
+  } else {
+    lines.push(`缺少 team 名。`, "", `  /team ${sub} <team名> [选项]`);
+  }
+
+  const known = listTeams();
+  if (sub === "join" && known.length) {
+    lines.push("", `本机已有:${known.join(", ")}`, `已配置过的 team 直接 /team join ${known[0]} 就行,不用再给 url 和 token。`);
+  }
+  if (sub === "create") {
+    lines.push("", "team 名只能用小写字母和数字,例如 dev、prod2。");
+  }
+
+  lines.push("", "选项:", OPTION_HELP);
+  return lines.join("\n");
+}
+
 function createResult(args, state) {
   // 位置形式(/team create t <url> [token])和选项形式都接受。
   // 位置形式保留是因为它用了很久,选项形式是为了设置 mode/seeds。
@@ -199,7 +233,7 @@ function createResult(args, state) {
   if (parsed.unknown.length) return bad(`认不出的选项:${parsed.unknown.join(", ")}\n${OPTION_HELP}`);
 
   const [team, posUrl, posToken] = parsed.rest;
-  if (!team) return bad(`用法:/team create <team> [url] [token] [选项]\n${OPTION_HELP}`);
+  if (!team) return bad(missingTeamName("create", parsed));
 
   const values = { ...parsed.values };
   if (posUrl && !values.url) values.url = posUrl;
@@ -232,17 +266,48 @@ function createResult(args, state) {
   if (req.warning) lines.push("", `注意:${req.warning}`);
 
   if (r.created) {
+    lines.push("", "生成的 token(只显示这一次,配置文件里也有一份):", r.token);
+  }
+
+  // create 只写本地配置、让本机去连。它不启动任何东西。
+  //
+  // 这一点以前没说,于是用户会以为 team 已经建好可以用了 —— 而此时
+  // 对面可能根本没有 broker 在监听,或者在监听但用的是另一个 token。
+  // 两种都表现为"连不上",看起来像网络问题。
+  if (r.config.mode === "broker") {
+    const host = (() => {
+      try {
+        return new URL(r.config.url).hostname;
+      } catch {
+        return "<broker 所在机器>";
+      }
+    })();
+    const port = (() => {
+      try {
+        return new URL(r.config.url).port || "8787";
+      } catch {
+        return "8787";
+      }
+    })();
     lines.push(
       "",
-      "生成的 token(只显示这一次,配置文件里也有一份):",
-      r.token,
+      `下一步:broker 需要你自己在 ${host} 上启动 —— /team create 不会替你启动它。`,
+      "在那台机器上运行(只需要 Node,不需要 Pi):",
       "",
-      "其它机器用这条加入:",
-      `/team join ${team} --url ${r.config.url ?? "<url>"} --token ${r.token}${
-        r.config.mode !== "broker" ? ` --mode ${r.config.mode}` : ""
-      }`,
+      `  TEAM_TOKEN='${r.token}' npx -y -p @yiki21/pi-agent-team pi-agent-team-broker --bind ${host} --port ${port}`,
+      "",
+      "token 必须和这里一致,否则 broker 会拒绝连接。",
+      "要常驻运行,见 docs/systemd.md。",
     );
   }
+
+  lines.push(
+    "",
+    "其它机器用这条加入:",
+    `  /team join ${team} --url ${r.config.url ?? "<url>"} --token ${r.token}${
+      r.config.mode !== "broker" ? ` --mode ${r.config.mode}` : ""
+    }`,
+  );
   // 创建后直接连上,省得用户再敲一次 join
   return ok(lines, {
     party: {
@@ -259,7 +324,7 @@ function joinResult(args, state) {
   if (parsed.unknown.length) return bad(`认不出的选项:${parsed.unknown.join(", ")}\n${OPTION_HELP}`);
 
   const [team, posUrl, posToken] = parsed.rest;
-  if (!team) return bad(`用法:/team join <team> [url] [token] [选项]\n${OPTION_HELP}`);
+  if (!team) return bad(missingTeamName("join", parsed));
 
   const values = { ...parsed.values };
   if (posUrl && !values.url) values.url = posUrl;

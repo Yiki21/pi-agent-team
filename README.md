@@ -81,8 +81,11 @@ TEAM_TOKEN=<token> npx -y -p @yiki21/pi-agent-team pi-agent-team-broker --bind "
 ```
 
 `pi install` puts the package somewhere that is not on your `PATH`, so the
-broker command is run through `npx` rather than by name. For a permanent setup,
-`npm install -g @yiki21/pi-agent-team` gives you `pi-agent-team-broker` directly.
+broker command is run through `npx` rather than by name.
+
+**For a permanent broker, use systemd** — a broker started from a terminal dies
+when you close it, and one in systemd comes back after a reboot. A unit file
+plus the reasoning is in [docs/systemd.md](docs/systemd.md).
 
 Then each node:
 

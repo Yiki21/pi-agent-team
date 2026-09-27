@@ -538,3 +538,125 @@ test("群发:@default 不被当成 label default", async (t) => {
   assert.ok(await waitFor(() => named.inbox.find((m) => m.id === "amb-1")));
   assert.ok(await waitFor(() => plain.inbox.find((m) => m.id === "amb-1")), "全员应包含没有该 tag 的节点");
 });
+
+// ---------------------------------------------------------------- /auth 诊断端点
+//
+// 为什么需要它:Node 内置 WebSocket 把握手阶段的 HTTP 状态完全藏起来了。
+// broker 返回 401 时,客户端只能看到 error(消息为空)+ close 1006 ——
+// 和网线被拔一模一样。实测过,不是推测。
+//
+// 所以客户端握手失败后,用普通 HTTP 调一次 /auth 来区分"token 错"和"连不上"。
+
+test("/auth:正确 token 返回 200", async (t) => {
+  const { port } = await withBroker(t);
+  const r = await fetch(`http://127.0.0.1:${port}/auth`, {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  });
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { ok: true });
+});
+
+test("/auth:错误 token 返回 401,并带上 broker 的 token 指纹", async (t) => {
+  const { port } = await withBroker(t);
+  const r = await fetch(`http://127.0.0.1:${port}/auth`, {
+    headers: { authorization: "Bearer wrong-token-value-here" },
+  });
+  assert.equal(r.status, 401);
+  const body = await r.json();
+  assert.equal(body.ok, false);
+  assert.equal(body.reason, "token_mismatch");
+  // 指纹让用户能核对"服务器用的是哪个 token",而不必把 token 本身发出去
+  assert.match(body.fingerprint, /^[0-9a-f]{8}$/);
+});
+
+test("/auth:不带 token 返回 401", async (t) => {
+  const { port } = await withBroker(t);
+  const r = await fetch(`http://127.0.0.1:${port}/auth`);
+  assert.equal(r.status, 401);
+  assert.equal((await r.json()).reason, "token_missing");
+});
+
+test("/auth:不接受 query 里的 token(避免进 access log)", async (t) => {
+  const { port } = await withBroker(t);
+  const r = await fetch(`http://127.0.0.1:${port}/auth?token=${TOKEN}`);
+  assert.equal(r.status, 401, "query 里的 token 不该被采纳");
+});
+
+test("/auth:错误 token 的响应里不含正确 token", async (t) => {
+  const { port } = await withBroker(t);
+  const r = await fetch(`http://127.0.0.1:${port}/auth`, {
+    headers: { authorization: "Bearer nope" },
+  });
+  const text = await r.text();
+  assert.equal(text.includes(TOKEN), false, "诊断信息绝不能泄露真实 token");
+});
+
+// ---------------------------------------------------------------- 启动失败
+//
+// 之前 server.listen 没有 error 处理,端口被占时抛出 Node 的原始堆栈:
+// 不说是谁占着,也不提最常见的原因 —— 已经有一个 broker 在跑了。
+// 真实用户在 dev01 上撞到过:一个 systemd 服务占着 8787,又手动起了一个。
+
+import { createServer as createNetServer } from "node:net";
+
+/** 起 broker,等它退出,返回 { code, stdout, stderr } */
+function runBrokerToExit(args, env = {}) {
+  return new Promise((resolve) => {
+    const p = spawn(process.execPath, [BROKER, ...args], {
+      env: { ...process.env, TEAM_TOKEN: TOKEN, ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    p.stdout.on("data", (d) => (stdout += d));
+    p.stderr.on("data", (d) => (stderr += d));
+    const timer = setTimeout(() => {
+      p.kill("SIGKILL");
+      resolve({ code: "timeout", stdout, stderr });
+    }, 8000);
+    p.on("exit", (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
+
+test("端口被占:退出码 78,并说明原因和排查方法", async (t) => {
+  // 先占住一个端口
+  const holder = createNetServer();
+  await new Promise((r) => holder.listen(0, "127.0.0.1", r));
+  const port = holder.address().port;
+  t.after(() => holder.close());
+
+  const r = await runBrokerToExit(["--bind", "127.0.0.1", "--port", String(port)]);
+
+  assert.equal(
+    r.code,
+    78,
+    "应以 78(EX_CONFIG)退出 —— systemd 可以用 RestartPreventExitStatus=78 停止无意义的重启",
+  );
+
+  const out = r.stdout + r.stderr;
+  assert.match(out, new RegExp(`127\\.0\\.0\\.1:${port}`), "要说出是哪个地址端口");
+  assert.match(out, /已被占用|already in use/, "要明说端口被占");
+  assert.match(out, /ss -ltnp|lsof/, "要给出查占用者的命令");
+  assert.match(out, /systemctl|已经.*在跑|another broker/, "要提示最常见的原因:已有实例在跑");
+  assert.equal(/at Server\.setupListenHandle/.test(out), false, "不该再打印 Node 的原始堆栈");
+});
+
+test("没有 TOKEN:仍然明确拒绝启动", async () => {
+  const r = await runBrokerToExit(["--bind", "127.0.0.1", "--port", "0"], { TEAM_TOKEN: "" });
+  assert.notEqual(r.code, 0);
+  assert.match(r.stderr, /TEAM_TOKEN/);
+});
+
+test("绑一个本机没有的地址:退出码 78,提示用 tailscale IP", async () => {
+  // 192.0.2.0/24 是 RFC 5737 的文档专用网段,保证不会配在任何真实接口上。
+  // 这对应 $(tailscale ip -4) 在 tailscale 没起来时展开成的情形。
+  const r = await runBrokerToExit(["--bind", "192.0.2.1", "--port", "0"]);
+  assert.equal(r.code, 78);
+  const out = r.stdout + r.stderr;
+  assert.match(out, /192\.0\.2\.1/, "要说出是哪个地址");
+  assert.match(out, /tailscale ip/, "要提示最常见的正确写法");
+  assert.equal(/at Server\.setupListenHandle/.test(out), false, "不该有原始堆栈");
+});

@@ -396,6 +396,35 @@ const server = createServer((req, res) => {
     res.end(JSON.stringify({ ok: true, count: peers.size, peers: nameList(), members: members() }));
     return;
   }
+  // 握手前的 token 诊断。
+  //
+  // 存在的理由:Node 内置 WebSocket 会把握手阶段的 HTTP 状态藏起来。
+  // 401 到了客户端只剩 error(空消息)+ close 1006,和网络断开无法区分。
+  // 客户端连接失败后调一次这个端点,才能说清"是 token 不对"。
+  //
+  // 只接受 Authorization 头,不接受 query —— query 会进访问日志和
+  // 浏览器历史,token 不该出现在那儿。
+  if (path === "/auth") {
+    const auth = req.headers.authorization ?? "";
+    const presented = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+
+    if (!presented) {
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, reason: "token_missing" }));
+      return;
+    }
+    if (!tokenOk(presented)) {
+      // 只给指纹,不给 token:用户能核对"服务器是哪个 token",
+      // 而信息本身泄露不了什么。
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, reason: "token_mismatch", fingerprint }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
   res.writeHead(404, { "content-type": "text/plain" });
   res.end("pi-agent-team broker\n");
 });
@@ -490,6 +519,54 @@ function socketWritePing(socket) {
 }
 
 // ------------------------------------------------------------------ 启动
+
+/**
+ * 绑定失败时的退出码。
+ *
+ * 78 是 sysexits(3) 的 EX_CONFIG —— "配置错了,重试没用"。
+ * 选一个有意义的码是为了让 systemd 能写:
+ *   RestartPreventExitStatus=78
+ * 否则它会按 Restart=on-failure 无限重启一个永远起不来的进程,
+ * 日志里刷满同样的错误。
+ */
+const EXIT_CONFIG = 78;
+
+server.on("error", (err) => {
+  if (err?.code === "EADDRINUSE") {
+    // 以前这里是裸的 server.listen,端口被占时抛的是 Node 的原始堆栈:
+    // 不说是谁占着,也不提最常见的原因 —— 已经有一个 broker 在跑了。
+    // 真实场景就撞到过:一个 systemd 服务占着 8787,又手动起了一个。
+    console.error(`\n拒绝启动:${args.bind}:${args.port} 已被占用。\n`);
+    console.error("查是谁占着:");
+    console.error(`  ss -ltnp | grep ${args.port}          # Linux`);
+    console.error(`  lsof -nP -iTCP:${args.port} -sTCP:LISTEN   # macOS`);
+    console.error("");
+    console.error("最常见的原因:这台机器上已经有一个 broker 在跑了 ——");
+    console.error("可能是先前手动启动的,也可能装成了服务:");
+    console.error("  systemctl status pi-agent-team-broker");
+    console.error("  systemctl --user status pi-agent-team-broker");
+    console.error("");
+    console.error("确认之后,要么停掉那个,要么给这个换一个端口:--port <其他端口>");
+    process.exit(EXIT_CONFIG);
+  }
+
+  if (err?.code === "EACCES") {
+    console.error(`\n拒绝启动:无权绑定 ${args.bind}:${args.port}。`);
+    console.error("1024 以下的端口需要特权。换一个高位端口,或改绑地址。\n");
+    process.exit(EXIT_CONFIG);
+  }
+
+  if (err?.code === "EADDRNOTAVAIL") {
+    console.error(`\n拒绝启动:本机没有地址 ${args.bind}。`);
+    console.error("这个地址必须已经配在本机某个接口上。常见做法是绑 tailscale IP:");
+    console.error("  --bind \"$(tailscale ip -4)\"");
+    console.error("或者只给本机用:--bind 127.0.0.1\n");
+    process.exit(EXIT_CONFIG);
+  }
+
+  console.error(`\n拒绝启动:绑定 ${args.bind}:${args.port} 失败:${err?.code ?? err?.message}\n`);
+  process.exit(EXIT_CONFIG);
+});
 
 server.listen(args.port, args.bind, () => {
   log(`broker 监听 ws://${args.bind}:${args.port}`);
