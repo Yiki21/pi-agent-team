@@ -71,9 +71,12 @@ test("所有 peerDependency 都标了 optional", () => {
   // 这个包有两种用法:作为 Pi 扩展(peer 必须存在),以及只为跑 broker
   // 而安装(那台机器上不需要 Pi)。
   //
-  // 不标 optional 时 npx -p 会把 Pi 连同它的依赖一起拉下来 —— 实测
-  // 435 MB,而 broker 只是个单文件脚本。npm install 只花 532 KB,所以
-  // 只看 npm install 发现不了;0.2.0 就是这么发出去的。
+  // 标了 optional,npm 就不会去装缺失的 peer —— 用最小合成包验证过:
+  // 同一条 peerDependencies,带标记时只装自己,不带时连着 peer 一起装。
+  //
+  // 注意:这条测试守的是约束,不是 435 MB 那个故障的原因。真正的原因是
+  // dependencies 里有条自依赖(见下一条测试);这条自依赖装进来的旧版本
+  // 恰好也声明了这些 peer,而旧版本没有标记。两件事都修掉了。
   const peers = Object.keys(pkg.peerDependencies ?? {});
   const meta = pkg.peerDependenciesMeta ?? {};
   const required = peers.filter((p) => meta[p]?.optional !== true);
@@ -82,4 +85,15 @@ test("所有 peerDependency 都标了 optional", () => {
     [],
     `这些 peer 没标 optional,npx 会强装它们:${required.join(", ")}`,
   );
+});
+
+test("零运行时依赖,尤其不能依赖自己", () => {
+  // README 承诺零运行时依赖。
+  //
+  // 0.1.0 之后的每个版本都带了 dependencies: { "@yiki21/pi-agent-team": "^0.1.0" }
+  // —— 在仓库内的子目录里跑 npm install 自己,npm 向上找到仓库根的
+  // package.json,把依赖写了进去。结果装这个包会连带装一份旧版本的自己,
+  // 而旧版本的 peer 没标 optional,于是整套 Pi(435 MB)被拖进来。
+  assert.equal(pkg.dependencies?.[pkg.name], undefined, "包不能依赖它自己");
+  assert.deepEqual(Object.keys(pkg.dependencies ?? {}), [], "应当零运行时依赖");
 });
