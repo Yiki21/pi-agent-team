@@ -31,8 +31,7 @@ import { Type } from "typebox";
 
 import { createBrokerTransport, CLOSE_REPLACED } from "./src/transport.js";
 import { MODES, createTransport, modeReadiness, normalizeSeeds, resolveMode } from "./src/mode.js";
-import { createSessionState, handleIncoming, knownLabels, newId, onTurnSettled, observeMessage, others, teamSize, applyRoster } from "./src/session.js";
-import { createInjectState, onInject, onRunStart, onSettled } from "./src/inject-queue.js";
+import { createSessionState, handleIncoming, knownLabels, newId, onTurnSettled, observeMessage, others, teamSize, applyRoster, TEAM_MESSAGE_TYPE } from "./src/session.js";
 import { createTeam, joinTeam, leaveTeam, listTeams, readTeam, toSocketUrl } from "./src/team-config.js";
 import { BULK_WARN_THRESHOLD, dispatch, doSend, sendMessage } from "./src/dispatch.js";
 
@@ -65,13 +64,29 @@ let ctxRef: ExtensionContext | null = null;
 let apiRef: ExtensionAPI | null = null;
 
 /**
- * 注入时机状态。规则和实测依据见 src/inject-queue.js。
+ * 队友消息以"自定义消息"送达(pi.sendMessage),不是用户消息。
  *
- * 简单说:第一条直发(由它开始一个 run),接下来的先排队,等
- * agent_start 到了再逐条以 followUp 投出。直接在同一个 tick 里连发
- * 多条会让后面的被覆盖 —— 而且调用还返回成功。
+ * ── 为什么不能用 sendUserMessage ──
+ * 它只支持 steer / followUp 两种投递。followUp 实测会结束当前 run:
+ *
+ *   227163ms  assistant ""            ← 原任务没做完
+ *   227165ms  agent_end               ← 当前 run 被收尾
+ *   227168ms  agent_start             ← 新 run
+ *   227169ms  user "队友消息"          ← 被当成你下的新指令
+ *   ...      原任务被挤乱,最后连收尾回复都没发出
+ *
+ * ── sendMessage 的实测行为 ──
+ *   空闲 + triggerTurn    → 起一个新 turn
+ *   流式中 + triggerTurn  → steer:当前 assistant turn 和它的工具调用
+ *                            结束后插入,不打断正在跑的工具
+ *   流式中 + 不触发       → 等当前 turn 结束再追加
+ *
+ * 忙时实测:原任务完整跑完并回复 FULLDONE,同时模型看到了队友消息
+ * 并在下一个 turn 开头就作了回应 —— 这是我们要的"立刻知道、不打断"。
+ *
+ * 另外 sendMessage 不会像 sendUserMessage 那样在同一 tick 里互相覆盖
+ * (实测同 tick 两条都进了模型),所以原来的注入队列不再需要。
  */
-let injectState = createInjectState();
 
 /** dispatch 需要的环境快照 */
 const envOf = () => ({
@@ -167,15 +182,13 @@ async function runIntentions(
 
       case "inject": {
         const payload = String(it.payload);
-        const { state: next, mode } = onInject(injectState, payload);
-        injectState = next;
-
-        // 排队的那条要等 agent_start,这里不能算"已送达"
-        if (mode === "queued") break;
-
         try {
-          if (mode === "followUp") apiRef?.sendUserMessage(payload, { deliverAs: "followUp" });
-          else apiRef?.sendUserMessage(payload);
+          // display:false —— 卡片已经由 card 意图画出来了,再画一次会重复。
+          // 实测 display:false 的自定义消息仍然进入模型上下文。
+          apiRef?.sendMessage(
+            { customType: TEAM_MESSAGE_TYPE, content: payload, display: false },
+            { triggerTurn: true },
+          );
         } catch (err) {
           const reason = (err as Error).message;
           const msg = `team:注入失败 ${reason}`;
@@ -183,6 +196,30 @@ async function runIntentions(
           ctx.ui.notify(msg, "error");
           // 发信人必须知道请求没进去,否则它会一直等回信
           void notifyInjectFailure(String(it.from ?? ""), reason, ctx);
+        }
+        break;
+      }
+
+      case "remind": {
+        // 请求已送达并且模型看到过,但这一轮结束时还没有回复。提醒一次,
+        // 并把这一轮叫起来 —— 否则忙时看到的请求会一直悬着没人处理。
+        const who = (it.pending as string[]) ?? [];
+        if (!who.length) break;
+        const payload = String(it.ref ?? "");
+        try {
+          apiRef?.sendMessage(
+            {
+              customType: TEAM_MESSAGE_TYPE,
+              content:
+                `[team 待回复]${who.join(", ")} 之前发来的请求还没有回复。` +
+                `现在就回复它:team_send({ to: "${who[0]}", text: "..." })。` +
+                `如果本来就不需要回复,忽略这条即可。\n\n${payload}`,
+              display: false,
+            },
+            { triggerTurn: true },
+          );
+        } catch (err) {
+          ctx.ui.notify(`team:提醒失败 ${(err as Error).message}`, "error");
         }
         break;
       }
@@ -249,7 +286,10 @@ async function runParty(party: Record<string, unknown> | undefined, ctx: Extensi
 }
 
 /** dispatch + 执行。命令和工具的统一入口。 */
-async function invoke(input: { sub: string; args: string[] }, ctx: ExtensionContext) {
+async function invoke(
+  input: { sub: string; args: string[]; origin?: "user" | "model" },
+  ctx: ExtensionContext,
+) {
   ctxRef = ctx;
   const r = dispatch(input, state, envOf());
 
@@ -470,7 +510,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerFlag("team-mode", { description: "投递模式:broker | mesh | swim", type: "string" });
   pi.registerFlag("team-seeds", { description: "mesh/swim 的种子地址,逗号分隔", type: "string" });
   pi.registerFlag("team-url", { description: "broker 模式的 URL(不读 team 配置)", type: "string" });
-  pi.registerFlag("team-announce", { description: "自动回信模式:off | auto | always", type: "string" });
+  pi.registerFlag("team-announce", { description: "回信提醒模式:off | auto | always", type: "string" });
 
   // ---- 生命周期
   pi.on("session_start", async (_event, ctx) => {
@@ -555,11 +595,12 @@ export default function (pi: ExtensionAPI) {
     // user 消息也要看:注入的 payload 会原样出现在这里,靠它把
     // "哪段回答对应哪个请求"绑起来。以前只处理 assistant,
     // 所以并发请求时只能记住最后一个,回答会寄给错误的人。
-    if (role === "user" || role === "assistant") {
-      observeMessage(state, role, extractAssistantText(m.content));
-    }
-    if (role === "assistant") {
-      state.lastText = extractAssistantText(m.content);
+    // 队友消息的 role 是 "custom"(实测),靠 customType 认出来。
+    // 这一步同时记录"模型确实看到了它" —— 只有看到过、又在这一轮里
+    // 没被回复的请求,才需要提醒。
+    const customType = (m as { customType?: string })?.customType ?? null;
+    if (role === "custom" || role === "user" || role === "assistant") {
+      observeMessage(state, role, extractAssistantText(m.content), customType);
     }
   });
 
@@ -568,22 +609,8 @@ export default function (pi: ExtensionAPI) {
   // 为什么必须等这一刻:agent_start 之前投 followUp 没有意义,那时代理
   // 还没开始处理,Pi 会把它当普通 prompt,于是又落回"被后一条覆盖"的
   // 那个窗口。探针在 before_agent_start 与 agent_start 之间实测过。
-  pi.on("agent_start", async () => {
-    const { state, flush } = onRunStart(injectState);
-    injectState = state;
-    for (const payload of flush) {
-      try {
-        apiRef?.sendUserMessage(payload, { deliverAs: "followUp" });
-      } catch (err) {
-        const reason = (err as Error).message;
-        ctxRef?.ui.notify(`team:排队消息注入失败 ${reason}`, "error");
-      }
-    }
-  });
-
   pi.on("agent_settled", async (_event, ctx) => {
     ctxRef = ctx;
-    injectState = onSettled(injectState);
     const actions = onTurnSettled(state);
     void runIntentions(actions as unknown as Array<Record<string, unknown>>, ctx);
   });
@@ -616,8 +643,8 @@ export default function (pi: ExtensionAPI) {
       "",
       "**接收**:输入里出现 `[来自 <名字> 的 team 消息]` 前缀时,那是另一个 agent 发来的请求,不是真人打字。",
       "按内容本身的意思回应:是任务就执行,是讨论就接着走。不要反问「需要我做什么」。",
-      "你这一轮的最终输出会自动回传给发信方。**不要**再用 team_send 回复,那会造成重复投递。",
-      "看到 `[来自 <名字> 的 team 回复]` 前缀时,你这一轮**不会**自动回传;要继续对话才显式调用 team_send。",
+      "**回复要用 team_send** —— 你这一轮的输出不会自动回传。发给谁就是回复谁,不需要额外参数。",
+      "不需要回复的(纯通知、寒暄)可以不管;系统最多提醒一次,不会反复打扰。",
       "",
       "**克制**:每次发送都占用对方一轮完整思考,群发更贵。除非任务需要,不要主动发消息。",
       "",
@@ -633,11 +660,12 @@ export default function (pi: ExtensionAPI) {
     name: "team_send",
     label: "Team Send",
     description:
-      "给同一 team 里的其他 Pi 节点发消息。to 可以是节点名、'@label' 分组、'*' 全员、'@default' 默认组,或逗号分隔的名字数组。名字从 team_roster 或系统提示的 Team 段落获取。",
-    promptSnippet: "team_send(to, text) — 给一个或一组 Pi 节点发消息",
+      "给同一 team 里的其他 Pi 节点发消息,也用它回复收到的队友消息。to 可以是节点名、'@label' 分组、'*' 全员、'@default' 默认组,或逗号分隔的名字数组。名字从 team_roster 或系统提示的 Team 段落获取。",
+    promptSnippet: "team_send(to, text) — 给一个或一组 Pi 节点发消息(也是回复队友的方式)",
     promptGuidelines: [
       "Use team_send only when the task spans another machine; each recipient costs a full model turn.",
-      "Never use team_send to reply to an incoming team message; that reply is automatic.",
+      "Replies are NOT automatic: when a teammate's message needs an answer, call team_send to answer it. Sending back to the same peer links it to their request automatically.",
+      "You can ignore a teammate's message when no answer is needed; it will be reminded once, not repeatedly.",
       "Broadcasting with '*' or '@label' wakes every matching node; prefer naming recipients.",
     ],
     parameters: Type.Object({
@@ -667,7 +695,10 @@ export default function (pi: ExtensionAPI) {
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       ctxRef = ctx;
-      const r = await invoke({ sub: "send", args: [params.to, params.text] }, ctx);
+      // origin:"model" —— 对方回复时靠它判断"模型知道这回事吗"。
+      // 以前这里没传,dispatch 一律记成 "user",于是模型发出的消息被
+      // 记成人发的,对方回复时只显示一张卡片,模型永远看不到那条回复。
+      const r = await invoke({ sub: "send", args: [params.to, params.text], origin: "model" }, ctx);
 
       if (!r.ok) {
         return {
@@ -737,7 +768,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "team_info",
     label: "Team Info",
-    description: "查看本节点在 team 里的状态:team 名、连接状态、broker、在线数量、自动回信模式。",
+    description: "查看本节点在 team 里的状态:team 名、连接状态、broker、在线数量、回信提醒模式。",
     promptSnippet: "team_info() — 查看 team 状态",
     parameters: Type.Object({
       what: Type.Optional(Type.String({ description: "'status'(默认)或 'peers'" })),
@@ -1214,12 +1245,12 @@ export default function (pi: ExtensionAPI) {
         },
       },
       {
-        label: `🔔 自动回信模式  (当前:${state.announce})`,
+        label: `🔔 回信提醒模式  (当前:${state.announce})`,
         run: async () => {
           const pick = await ctx.ui.select("announce 模式", [
-            "off  —  只手动发送",
-            "auto  —  收到请求后自动回一次",
-            "always  —  每轮都推给所有节点(两边都开会互相刷屏)",
+            "off  —  只手动发送,不提醒",
+            "auto  —  请求没被回复时提醒一次",
+            "always  —  每轮输出都镜像给所有节点(两边都开会互相刷屏)",
           ]);
           if (!pick) return;
           const r = await invoke({ sub: "announce", args: [pick.split(" ")[0]] }, ctx);

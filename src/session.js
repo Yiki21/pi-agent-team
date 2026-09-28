@@ -47,12 +47,10 @@ const MAX_PENDING_REPLIES = 32;
  * @typedef {{ seen: Set<string>, injected: Set<string>, outbound: Map<string, Outbound>,
  *             members: Member[], self: string, selfLabels: string[],
  *             announce: "off"|"auto"|"always",
- *             pendingReplies: PendingReply[], answering: PendingReply[],
- *             lastRole: "user"|"assistant"|null,
- *             lastText: string }} SessionState
+ *             pendingReplies: PendingReply[], lastText: string }} SessionState
  *
- * @typedef {{ to: string, hops: number, re: string, payload: string,
- *             bound: boolean, text: string|null }} PendingReply
+ * @typedef {{ to: string, re: string, hops: number, at: number,
+ *             ref: string, seen: boolean, reminded: boolean }} PendingReply
  *
  * @typedef {{ type: "inject", payload: string, from: string }
  *   | { type: "card", kind: "receive"|"send"|"reply"|"failed"|"fyi", peer: string, text: string, reason?: string }
@@ -80,26 +78,27 @@ export function createSessionState(self = "") {
     selfLabels: [],
     announce: "auto",
     /**
-     * 待自动回复的请求,按到达顺序。
+     * 已收到、但还没有得到回复的队友请求。
      *
-     * 以前是单槽,后到的覆盖先到的。实测(Pi 0.87)两条并发请求的事件序列:
+     * ── 为什么不再自动回信,而是让模型显式回复 ──
      *
-     *   agent_start
-     *     turn: user "请求 A" → assistant "对 A 的回答"
-     *     turn: user "请求 B" → assistant "对 B 的回答"     ← followUp 是新 turn
-     *   agent_end → agent_settled                           ← 只 settle 一次
+     * 队友消息现在以 sendMessage 自定义消息送达(role="custom"),理由是
+     * sendUserMessage 只有 steer/followUp 两种投递方式,而 followUp 实测会
+     * 结束当前 run、原任务被挤乱 —— 实测中原任务连收尾回复都没发出来。
      *
-     * settle 时 lastText 已经是对 B 的回答。所以单槽的问题不只是"A 收不到",
-     * 天真地改成队列、把 lastText 发给所有人也不对 —— A 会收到答非所问的回复。
+     * 但换了投递方式之后,"哪段输出是给谁的回复"就没法从 turn 边界推断了:
+     * 实测模型会在同一个 run 里先回应队友、再继续做完原任务:
      *
-     * 正确做法:每段 assistant 文本归属于它前面那条 user 消息。注入的 user
-     * 消息会原样出现在 message_end 里,按 payload 精确匹配就能绑定。
+     *   111711ms  message_end role=custom text="TICKPROBE-BUSY"
+     *   134544ms  assistant "Got TICKPROBE-BUSY. The first slowwork c..."
+     *   150032ms  assistant "FULLDONE"        ← 原任务的收尾
+     *
+     * 按"最后一段"回信会把 FULLDONE 发给队友,答非所问。所以改为:模型用
+     * team_send 显式回复,这里只负责跟踪"谁还没被回复",必要时提醒一次。
      */
     pendingReplies: [],
-    /** 当前 turn 正在回答的请求(可能不止一个:followUpMode=all 会把多条合进一个 turn) */
-    answering: [],
-    /** 上一条 user/assistant 消息的角色,用来判断连续的 user 消息是否同属一个 turn */
-    lastRole: null,
+    /** 上一轮的输出文本,供 announce=always 镜像用 */
+    lastText: "",
     lastText: "",
   };
 }
@@ -334,8 +333,10 @@ export function buildPayload(from, text, cls) {
     `[来自 ${from} 的 team 消息]\n${text}\n\n---\n` +
     `上面是 teammate ${from} 发来的消息原文(不是真人用户在打字)。` +
     `按内容本身的意思回应:是任务就执行,是讨论/诗句/提问就接着往下走。` +
-    `不要反问"需要我做什么",也不要复述确认。` +
-    `你这一轮的最终输出会自动原样回传给 ${from}。`
+    `不要反问"需要我做什么",也不要复述确认。\n` +
+    `你这一轮的输出【不会】自动回传给 ${from}。要回复它,显式调用 ` +
+    `team_send({ to: "${from}", text: "..." });它会和这条请求关联起来。` +
+    `不回复也可以 —— 需要收尾的话做一次就好。`
   );
 }
 
@@ -427,34 +428,19 @@ export function handleIncoming(s, env, now = Date.now()) {
   const actions = [{ type: "card", kind: "receive", peer: env.from, text }];
 
   if (cls.autoReply) {
-    // 有上限:settle 永远不来时(比如 Pi 卡死),队列不能无限增长。
-    // 挤掉的那条要说出来,不能静默丢。
-    if (s.pendingReplies.length >= MAX_PENDING_REPLIES) {
-      const dropped = s.pendingReplies.shift();
+    const dropped = rememberPending(s, { from: env.from, id: env.id, hops, ref: payload });
+    if (dropped) {
       actions.push({
         type: "card",
         kind: "failed",
         peer: dropped.to,
         text: "",
-        reason: `待回复超过 ${MAX_PENDING_REPLIES} 条,${dropped.to} 的请求不会自动回复`,
+        reason: `待回复超过 ${MAX_PENDING_REPLIES} 条,${dropped.to} 的请求已被丢弃`,
       });
     }
-    // 同一个发信人只保留一条。
-    //
-    // 它连发三条时,三条都进了模型,但我们只该自动回一次 —— 否则
-    // 三个队友各发三条就会得到九条回信,而它们本来是一段回答。
-    //
-    // 保留最新的一条:回信带的 re 必须指向对端最近的那次请求,
-    // 它靠这个 id 把回信和自己的提问对上。
-    const existing = s.pendingReplies.findIndex((p) => p.to === env.from);
-    if (existing >= 0) s.pendingReplies.splice(existing, 1);
-
-    // payload 是之后在 message_end 里认出"这条 user 消息就是它"的依据,
-    // 所以必须和注入给 Pi 的字符串完全一致
-    s.pendingReplies.push({ to: env.from, hops, re: env.id, payload, bound: false, text: null });
   }
 
-  actions.push({ type: "inject", payload, from: env.from });
+  actions.push({ type: "inject", payload, from: env.from, re: env.id, hops });
   return actions;
 }
 
@@ -472,41 +458,29 @@ function describeUndeliverable(body) {
 // ---------------------------------------------------------------- 出站决策
 
 /**
- * 观察一条消息,维护"哪段回答对应哪个请求"。
+ * 观察一条消息。
  *
- * 事件的真实形状(实测 Pi 0.87,两条并发请求):
+ * 队友消息现在以自定义消息送达,role 是 `"custom"` 而不是 `"user"`
+ * (实测),所以这里按 customType 识别,并记录"模型确实看到了它"。
  *
- *   agent_start
- *     turn: user "A(I 注入的 payload)" → assistant "对 A 的回答"
- *     turn: user "B(I 注入的 payload)" → assistant "对 B 的回答"   ← followUp 另起 turn
- *   agent_end → agent_settled
- *
- * 所以有两条线索可以采用:
- *   1. 注入的 user 消息会原样出现在这里,payload 能精确匹配到队列条目
- *   2. 连续的 user 消息属于同一个 turn(followUpMode=all 时多条合入一个 turn),
- *      而 turn 边界出现在 assistant 消息之后
+ * 为什么要记 seen:忙时送达的消息会被排在下一个 turn 的开头,模型可能
+ * 还没机会看它 run 就结束了。只有 seen 为 true 的请求才需要提醒 ——
+ * 没被看到的那些,它们会自己触发新的一轮。
  */
-export function observeMessage(s, role, text) {
-  if (role === "user") {
-    // 匹配尚未绑定的队列条目
-    const hit = s.pendingReplies.find((p) => !p.bound && p.payload === text);
-    if (hit) {
-      hit.bound = true;
-      // 上一个角色也是 user,说明这是同一个 turn 里的第二条 payload,
-      // 两条共用接下来那段回答。否则是新 turn,清空交接。
-      if (s.lastRole !== "user") s.answering = [];
-      s.answering.push(hit);
-    }
-  } else if (role === "assistant") {
-    // 这段文本就是当前 turn 对所有待答请求的回答
-    for (const p of s.answering) p.text = text;
-    s.answering = [];
+export function observeMessage(s, role, text, customType = null) {
+  if (role === "custom" && customType === TEAM_MESSAGE_TYPE) {
+    const hit = s.pendingReplies.find((p) => p.ref === text && !p.seen);
+    if (hit) hit.seen = true;
+    return;
   }
-  s.lastRole = role;
+  if (role === "assistant") s.lastText = text;
 }
 
+/** 队友消息用的 customType —— index.ts 注入时和这里必须是同一个值 */
+export const TEAM_MESSAGE_TYPE = "team-msg";
+
 /**
- * 轮次结束后决定是否推送、推给谁。产出动作。
+ * 轮次结束后该做什么。产出动作。
  *
  * 用 agent_settled 触发,不用 agent_end:后者之后还可能有重试、
  * compaction、queued continuation,拿它当"结束"会推中间态。
@@ -514,7 +488,6 @@ export function observeMessage(s, role, text) {
 export function onTurnSettled(s) {
   if (s.announce === "off") {
     s.pendingReplies = [];
-    s.answering = [];
     s.lastText = "";
     return [];
   }
@@ -541,78 +514,106 @@ export function onTurnSettled(s) {
     }));
   }
 
-  // auto:把每个待回复逐一送出去
-  const queue = s.pendingReplies;
-  s.pendingReplies = [];
-  s.answering = [];
-  if (queue.length === 0) return [];
-
-  s.lastText = "";
+  // auto:不再自动把某段文本当成回复发出去 —— 实测模型会在同一个 run 里
+  // 先回应队友再做完原任务,按段落猜归属会把原任务的收尾(i.e. "DONE")
+  // 发给队友。改为:只在请求还没被回复时提醒模型一次。
   const actions = [];
   const online = new Set(others(s).map((m) => m.name));
+  const stillPending = [];
 
-  for (const p of queue) {
-    // 没绑到回答文本,说明它的 user 消息没进模型,或者进了但这一轮没产出文字
-    // (注入被拒、被用户 Esc 中止、只调用了工具)。这时不能拿别的请求的回答
-    // 或 lastText 顶上 —— 那正是这次修复要消除的"答非所问"。
-    // 出失败卡片,让人看见这条请求没有被回复。
-    const text = p.text;
-    if (!text || !text.trim()) {
+  for (const p of s.pendingReplies) {
+    if (!online.has(p.to)) {
+      // 对方已经不在线了,再提醒也没有意义
       actions.push({
         type: "card",
         kind: "failed",
         peer: p.to,
         text: "",
-        reason: `${p.to} 的请求没有得到对应的回答,未自动回复`,
+        reason: `${p.to} 已离线,它的请求没有得到回复`,
       });
       continue;
     }
 
-    // 对方可能在回信之前就下线了。
-    if (!online.has(p.to)) {
-      actions.push({
-        type: "card",
-        kind: "failed",
-        peer: p.to,
-        text,
-        reason: `${p.to} 已离线,回复没有送出`,
-      });
+    if (!p.seen) {
+      // 模型还没看到这条消息。它会被排进下一个 turn,那时再判断是否需要提醒。
+      stillPending.push(p);
       continue;
     }
 
-    // 每条回复带自己的 re 和 hops —— 那是拓扑正确性,不能共用。
-    const hops = p.hops + 1;
-    if (hops >= MAX_HOPS) {
-      actions.push({
-        type: "send",
-        to: p.to,
-        text,
-        hops,
-        re: p.re,
-        origin: "model",
-        fyi: false,
-        id: newId(),
-        targets: [p.to],
-        card: { kind: "send", peer: p.to, text, reason: `已达跳数上限 ${MAX_HOPS},对端不会再回传` },
-      });
+    if (!p.reminded) {
+      p.reminded = true;
+      stillPending.push(p);
+      actions.push({ type: "remind", pending: [p.to], ref: p.ref });
       continue;
     }
 
+    // 已经提醒过一次仍未回复。不再打扰,但在本机说明清楚 —— 静默丢掉会
+    // 让用户以为对方收到了回复。
     actions.push({
-      type: "send",
-      to: p.to,
-      text,
-      hops,
-      re: p.re,
-      origin: "model",
-      fyi: false,
-      id: newId(),
-      targets: [p.to],
-      card: { kind: "reply", peer: p.to, text },
+      type: "card",
+      kind: "failed",
+      peer: p.to,
+      text: "",
+      reason: `已提醒一次但 ${p.to} 的请求仍未被回复`,
     });
   }
 
+  s.pendingReplies = stillPending;
   return actions;
+}
+
+/**
+ * 记录一条待回复的请求。
+ *
+ * 同一个发信人只保留最新一条:它连发三条时,三条都进了模型,但回一次
+ * 就够了 —— 否则三个队友各发三条会得到九条回信,而它们本来是一段回答。
+ */
+export function rememberPending(s, { from, id, hops, ref }) {
+  const existing = s.pendingReplies.findIndex((p) => p.to === from);
+  if (existing >= 0) s.pendingReplies.splice(existing, 1);
+
+  if (s.pendingReplies.length >= MAX_PENDING_REPLIES) {
+    const dropped = s.pendingReplies.shift();
+    dropped.dropped = true;
+    return dropped;
+  }
+
+  s.pendingReplies.push({
+    to: from,
+    re: id,
+    hops,
+    at: Date.now(),
+    ref,
+    seen: false,
+    reminded: false,
+  });
+  return null;
+}
+
+/**
+ * 把一次出站发送绑定到某个待回复的请求上。
+ *
+ * 这是"显式回复"里那个"显式"能省掉的部分:模型按提示直接
+ * `team_send(to, text)` 不带 re 时,如果那个发信人正有待回复的请求,
+ * 就自动认成回复 —— 带上原本的 re、并把跳数 +1。
+ *
+ * 不这么做的话,reply 会被对端当成一条新请求(re 为空),于是两个
+ * agent 会一直互相触发下去,只能靠跳数上限兜住。
+ *
+ * @returns {{ replyTo: string|null, re: string|null, hops: number }}
+ */
+export function bindReply(s, targets) {
+  const list = Array.isArray(targets) ? targets : [targets];
+  if (list.length !== 1) return { replyTo: null, re: null, hops: 0 };
+
+  const to = list[0];
+  const idx = s.pendingReplies.findIndex((p) => p.to === to);
+  if (idx < 0) return { replyTo: null, re: null, hops: 0 };
+
+  const p = s.pendingReplies[idx];
+  // 回一次就把它所有的请求都算答完 —— 它连发三条,回一次就够
+  s.pendingReplies = s.pendingReplies.filter((x) => x.to !== to);
+  return { replyTo: to, re: p.re, hops: Math.min(p.hops + 1, MAX_HOPS) };
 }
 
 /** 从 assistant 消息里取文本 */

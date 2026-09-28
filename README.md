@@ -19,11 +19,14 @@ No public relay, no phone app, no account.
   labels.
 - **Send to one, several, a label group, or everyone.** `other`, `a,b`, `@web`,
   `*`.
-- **A teammate's message becomes a real turn.** It goes into the model's
-  context, so the model answers it the way it answers you — and the answer goes
-  back automatically.
-- **The conversation ends.** One request, one reply. Replies are not
-  auto-answered, so two agents cannot talk in circles.
+- **A teammate's message reaches the model without interrupting it.** It is
+  delivered as a custom message: while the agent is mid-tool-call it queues, and
+  the model sees it at the next turn instead of having its work cut short.
+- **The model answers with `team_send`.** No output is mirrored automatically,
+  so a run that was doing something else cannot have its tail sent to the wrong
+  peer as a "reply".
+- **The conversation ends.** A request is answered; a reply is not. Two agents
+  cannot talk in circles.
 - **You can see it.** `📥 RECV` / `📤 SEND` / `🔁 REPLY` / `⚠️ FAIL` cards in the
   transcript. Display only — they never enter the model's context.
 - **Two entry points.** `/team` commands for you, `team_*` tools for the model.

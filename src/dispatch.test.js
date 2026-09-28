@@ -420,9 +420,12 @@ test("契约:两个生产者的 send 意图字段集一致", async () => {
 
   const s = createSessionState("me");
   applyRoster(s, { members: [{ name: "me", labels: [], host: null, addr: null, since: 0 }, { name: "peer", labels: [], host: null, addr: null, since: 0 }] });
-  s.pendingReplies = [{ to: "peer", hops: 0, re: "r1", payload: "p", bound: true, text: "y" }];
+  // auto 模式下 settle 不再产出 send(回复改由模型显式调 team_send),
+  // 所以用 always 模式 —— 它是 settle 仍会产出 send 的那条路径。
+  s.announce = "always";
   s.lastText = "y";
   const fromSession = onTurnSettled(s).find((i) => i.type === "send");
+  assert.ok(fromSession, "前置条件:always 模式应产出 send");
 
   const keys = (o) => Object.keys(o).sort().join(",");
   assert.equal(
@@ -609,4 +612,42 @@ test("join:--port/--listen 只影响本次连接,不落盘", async (t) => {
     "端口不能落盘:同机第二个 agent 会监听同一个端口,EADDRINUSE 起不来",
   );
   assert.equal("listen" in saved, false);
+});
+
+
+// ---------------------------------------------------------------- 显式回复与 origin
+
+test("send:工具路径记 origin=model,命令路径记 origin=user", () => {
+  // 以前 dispatch 一律记成 "user",连 team_send 工具也是。于是模型发出的
+  // 消息被当成人发的,对方回复时只显示一张卡片,模型永远看不到回复。
+  const c = setup();
+  const byModel = run("send", ["peer", "模型发的"], { ...c });
+  const idModel = byModel.intentions.find((i) => i.type === "send").id;
+
+  const viaTool = dispatch({ sub: "send", args: ["peer", "工具发的"], origin: "model" }, c.state, c.env);
+  const idTool = viaTool.intentions.find((i) => i.type === "send").id;
+
+  assert.equal(c.state.outbound.get(idModel).origin, "user", "/team send 是人发的");
+  assert.equal(c.state.outbound.get(idTool).origin, "model", "team_send 工具是模型发的");
+});
+
+test("send:发给正有待回复请求的队友 → 自动带上 re,认成回复", async () => {
+  const { rememberPending } = await import("./session.js");
+  const c = setup();
+  rememberPending(c.state, { from: "peer", id: "req-42", hops: 0, ref: "p" });
+
+  const r = dispatch({ sub: "send", args: ["peer", "这是回复"], origin: "model" }, c.state, c.env);
+  const send = r.intentions.find((i) => i.type === "send");
+  assert.equal(send.re, "req-42", "不带 re 的话对端会当成新请求,两边会一直互相触发");
+  assert.equal(send.hops, 1);
+  assert.equal(c.state.pendingReplies.length, 0, "回复之后不再算待回复");
+  assert.ok(r.lines.some((l) => /作为对 peer/.test(l)), "要让模型/用户知道这次发送被认成了回复");
+});
+
+test("send:没有待回复时照常作为新消息发出", () => {
+  const c = setup();
+  const r = dispatch({ sub: "send", args: ["peer", "新话题"], origin: "model" }, c.state, c.env);
+  const send = r.intentions.find((i) => i.type === "send");
+  assert.equal(send.re, null);
+  assert.equal(send.hops, 0);
 });

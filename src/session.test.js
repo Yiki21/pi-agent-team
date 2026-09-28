@@ -14,7 +14,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   MAX_HOPS,
+  TEAM_MESSAGE_TYPE,
   applyRoster,
+  bindReply,
   buildPayload,
   classifyInbound,
   createSessionState,
@@ -26,6 +28,7 @@ import {
   onTurnSettled,
   others,
   parseRecipients,
+  rememberPending,
   resolveLocal,
   sendMessage,
   teamSize,
@@ -40,31 +43,6 @@ const member = (name, over = {}) => ({
   labels: over.labels ?? [],
   since: over.since ?? 0,
 });
-
-/**
- * 模拟 Pi 把一轮跑完,并喂给 observeMessage 的事件序列。
- *
- * 参数 turns 的形状是 [[请求 payload, 回答文本], ...],按实测的事件顺序:
- *   user <payload> → assistant <回答>
- * 连续两个 user 之间没有 assistant,说明它们在同一个 turn(followUpMode=all)。
- */
-function runTurns(s, turns) {
-  for (const [payload, answer] of turns) {
-    observeMessage(s, "user", payload);
-    observeMessage(s, "assistant", answer);
-    s.lastText = answer;
-  }
-}
-
-/**
- * 直接造一条待回复条目。
- *
- * 用于只关心"送出"逻辑的测试 —— 跳过注入和事件绑定那两步。
- * text 为 null 表示还没绑定到回答。
- */
-function pending(to, over = {}) {
-  return { to, hops: over.hops ?? 0, re: over.re ?? `req-${to}`, payload: over.payload ?? `payload-${to}`, bound: over.bound ?? true, text: over.text ?? "回答内容" };
-}
 
 /** 造一个已连上、roster 已填充的会话 */
 function session(self = "me", peers = [member("peer")], over = {}) {
@@ -116,7 +94,7 @@ test("knownLabels:汇总他人的 label,不含自己的", () => {
 
 test("缺口 1:broker 重启后 welcome 重建 roster", () => {
   const s = session("me", [member("old-peer")]);
-  s.pendingReplies = [pending("old-peer")];
+  rememberPending(s, { from: "old-peer", id: "r", hops: 0, ref: "p" });
 
   // broker 重启:连接断开 → 客户端清空视图 → 重连收到新 welcome
   s.members = [];
@@ -152,46 +130,63 @@ test("缺口 1:重启后到达的回复,原消息未知 → 注入但不自动�
 });
 
 test("缺口 1:重启后待回复失效,settled 时不误发", () => {
+  // 重启后 roster 是空的,而队列里还留着一条来自已消失节点的请求。
   const s = session("me", []);
-  s.pendingReplies = [pending("gone-peer", { text: "想回的答复" })];
-  s.lastText = "想回的答复";
+  rememberPending(s, { from: "gone-peer", id: "r", hops: 0, ref: "p" });
+  s.pendingReplies[0].seen = true;
 
   const actions = onTurnSettled(s);
   assert.equal(actions[0].type, "card");
-  assert.equal(actions[0].kind, "failed", "对端已不在 roster,不能假装发送成功");
+  assert.equal(actions[0].kind, "failed", "对端已不在 roster,不能假装提醒送到了");
   assert.match(actions[0].reason, /已离线/);
+  assert.equal(s.pendingReplies.length, 0);
 });
 
 // ================================================================ 缺口 2:对端中途离线
 
-test("缺口 2:请求发出后对端离线,回信失败并出 fail 卡片", () => {
+test("缺口 2:对端离线时,它的待回复请求出 fail 卡片", () => {
   const s = session("me", [member("peer")]);
-  s.pendingReplies = [pending("peer", { re: "req-1", text: "答复内容" })];
-  s.lastText = "答复内容";
+  rememberPending(s, { from: "peer", id: "req-1", hops: 0, ref: "payload" });
+  s.pendingReplies[0].seen = true; // 模型看到过
 
-  // 对端掉线,roster 更新
-  applyRoster(s, { members: [member("me")] });
+  applyRoster(s, { members: [member("me")] }); // 对端掉线
 
   const actions = onTurnSettled(s);
   assert.equal(actions.length, 1);
   assert.equal(actions[0].type, "card");
   assert.equal(actions[0].kind, "failed");
   assert.match(actions[0].reason, /peer 已离线/);
-  assert.equal(s.pendingReplies.length, 0, "失败后待回复队列应清空");
-  assert.equal(s.lastText, "", "文本已消费,不该在下轮重复推");
+  assert.equal(s.pendingReplies.length, 0, "离线的不该继续留在队列里");
 });
 
-test("缺口 2:对端在线时正常回信,带 re 且跳数 +1", () => {
+test("缺口 2:看到过但没回复 → 提醒一次,带上 re 原文", () => {
   const s = session("me", [member("peer")]);
-  s.pendingReplies = [pending("peer", { hops: 1, re: "req-1", text: "答复" })];
-  s.lastText = "答复";
+  rememberPending(s, { from: "peer", id: "req-1", hops: 1, ref: "payload-原文" });
+  s.pendingReplies[0].seen = true;
 
-  const [action] = onTurnSettled(s);
-  assert.equal(action.type, "send");
-  assert.equal(action.re, "req-1", "re 是闭合环路的关键,必须带上");
-  assert.equal(action.hops, 2, "自动回信时跳数递增");
-  assert.equal(action.origin, "model");
-  assert.equal(action.card.kind, "reply");
+  const first = onTurnSettled(s);
+  assert.equal(first.length, 1);
+  assert.equal(first[0].type, "remind", "应产出提醒");
+  assert.deepEqual(first[0].pending, ["peer"]);
+  assert.equal(first[0].ref, "payload-原文", "提醒要把原请求带上");
+  assert.equal(s.pendingReplies.length, 1, "提醒过还不算回复");
+
+  // 再 settle:已经提醒过,不再重复打扰
+  const second = onTurnSettled(s);
+  assert.equal(second.length, 1);
+  assert.equal(second[0].type, "card");
+  assert.equal(second[0].kind, "failed", "两次都不回就本机说清楚");
+  assert.match(second[0].reason, /仍未被回复/);
+});
+
+test("缺口 2:模型还没看到时不提醒 —— 它会被排进下一个 turn", () => {
+  const s = session("me", [member("peer")]);
+  rememberPending(s, { from: "peer", id: "req-1", hops: 0, ref: "payload" });
+  // seen 仍是 false:忙时送达、还没轮到模型看
+
+  const actions = onTurnSettled(s);
+  assert.deepEqual(actions, [], "没看到就不该催,下一轮它会自己触发");
+  assert.equal(s.pendingReplies.length, 1, "仍留在队列里");
 });
 
 test("缺口 2:没有待回复时 settled 不发任何东西", () => {
@@ -200,121 +195,62 @@ test("缺口 2:没有待回复时 settled 不发任何东西", () => {
   assert.deepEqual(onTurnSettled(s), [], "用户手动提问的轮次不该推给任何人");
 });
 
-// ================================================================ 缺口 3:并发请求
+// ================================================================ 显式回复
 
-test("缺口 3:同一轮两个请求,各自拿到自己的回答", () => {
-  const s = session("me", [member("a"), member("b")]);
+test("bindReply:回给有待回复请求的队友 → 带上原来的 re,跳数 +1", () => {
+  const s = session("me", [member("peer")]);
+  rememberPending(s, { from: "peer", id: "req-9", hops: 1, ref: "p" });
 
-  // 两个队友几乎同时发来请求。第二条到达时 run 已在进行中,
-  // 所以它走 followUp —— Pi 会给它单独一个 turn。
-  const na = handleIncoming(s, { from: "a", id: "req-a", re: null, body: { text: "来自 a" } });
-  const nb = handleIncoming(s, { from: "b", id: "req-b", re: null, body: { text: "来自 b" } });
-
-  assert.equal(s.pendingReplies.length, 2, "两条请求都进了队列,没有互相覆盖");
-  const payloadA = na.find((x) => x.type === "inject").payload;
-  const payloadB = nb.find((x) => x.type === "inject").payload;
-
-  // Pi 实际跑出的形状:两个 turn,每个 turn 一条 user + 一条 assistant
-  runTurns(s, [
-    [payloadA, "回答给 a"],
-    [payloadB, "回答给 b"],
-  ]);
-
-  const sends = onTurnSettled(s).filter((x) => x.type === "send");
-  assert.equal(sends.length, 2, "两个发信人都要收到回信");
-
-  const byTo = Object.fromEntries(sends.map((x) => [x.to, x]));
-  assert.equal(byTo.a.text, "回答给 a", "a 必须收到回答 a 的那段文本");
-  assert.equal(byTo.b.text, "回答给 b", "b 必须收到回答 b 的那段文本");
-  assert.equal(byTo.a.re, "req-a", "每条回复关联自己的请求 id");
-  assert.equal(byTo.b.re, "req-b");
+  const r = bindReply(s, ["peer"]);
+  assert.equal(r.replyTo, "peer");
+  assert.equal(r.re, "req-9", "不带 re 的话对端会当成新请求,两个 agent 会互相触发下去");
+  assert.equal(r.hops, 2);
+  assert.equal(s.pendingReplies.length, 0, "回一次就算答完,从队列移除");
 });
 
-test("缺口 3:followUpMode=all 把多条注入合进一个 turn,共用那段回答", () => {
-  const s = session("me", [member("a"), member("b")]);
+test("bindReply:回给别人 / 群发 → 不绑定", () => {
+  const s = session("me", [member("peer"), member("other")]);
+  rememberPending(s, { from: "peer", id: "req-9", hops: 0, ref: "p" });
 
-  const na = handleIncoming(s, { from: "a", id: "req-a", re: null, body: { text: "来自 a" } });
-  const nb = handleIncoming(s, { from: "b", id: "req-b", re: null, body: { text: "来自 b" } });
-  const payloadA = na.find((x) => x.type === "inject").payload;
-  const payloadB = nb.find((x) => x.type === "inject").payload;
-
-  // 连续两条 user 之后才出现 assistant —— 模型同时看到了两条输入
-  observeMessage(s, "user", payloadA);
-  observeMessage(s, "user", payloadB);
-  observeMessage(s, "assistant", "一次性回答了两条");
-  s.lastText = "一次性回答了两条";
-
-  const sends = onTurnSettled(s).filter((x) => x.type === "send");
-  assert.equal(sends.length, 2);
-  for (const x of sends) assert.equal(x.text, "一次性回答了两条", "同 turn 的两条共用同一段回答");
-  assert.deepEqual(sends.map((x) => x.re).sort(), ["req-a", "req-b"]);
+  assert.equal(bindReply(s, ["other"]).re, null, "回给别人不是回复 peer 的请求");
+  assert.equal(bindReply(s, ["peer", "other"]).re, null, "群发不该被当成某一条的回复");
+  assert.equal(s.pendingReplies.length, 1, "没绑上就不该动队列");
 });
 
-test("缺口 3:同一发信人连发多条,只自动回复一次", () => {
-  const s = session("me", [member("a")]);
-
-  for (const id of ["r1", "r2", "r3"]) {
-    handleIncoming(s, { from: "a", id, re: null, body: { text: `第 ${id} 条` } });
-  }
-  assert.equal(s.pendingReplies.length, 1, "同一个发信人只保留一条待回复");
-
-  // 三条 user 都进了模型,但只有最后一条 payload 在队列里
-  runTurns(s, [[s.pendingReplies[0].payload, "一起答了"]]);
-
-  const sends = onTurnSettled(s).filter((x) => x.type === "send");
-  assert.equal(sends.length, 1, "不该为同一个发信人产生三条回信");
-  assert.equal(sends[0].to, "a");
+test("bindReply:跳数到上限时封顶,不越界", () => {
+  const s = session("me", [member("peer")]);
+  rememberPending(s, { from: "peer", id: "r", hops: MAX_HOPS - 1, ref: "p" });
+  assert.equal(bindReply(s, ["peer"]).hops, MAX_HOPS);
 });
 
-test("缺口 3:请求没进模型时出失败卡片,不拿别的回答顶上", () => {
-  const s = session("me", [member("a"), member("b")]);
-
-  const na = handleIncoming(s, { from: "a", id: "req-a", re: null, body: { text: "来自 a" } });
-  handleIncoming(s, { from: "b", id: "req-b", re: null, body: { text: "来自 b" } });
-
-  // 只有 a 的 payload 进了模型(比如 b 那条注入被 Pi 拒绝)
-  const payloadA = na.find((x) => x.type === "inject").payload;
-  runTurns(s, [[payloadA, "只回答了 a"]]);
-
-  const actions = onTurnSettled(s);
-  const sends = actions.filter((x) => x.type === "send");
-  const fails = actions.filter((x) => x.type === "card" && x.kind === "failed");
-
-  assert.equal(sends.length, 1);
-  assert.equal(sends[0].to, "a");
-  assert.equal(fails.length, 1, "b 要看到失败,而不是收到 a 的回答");
-  assert.equal(fails[0].peer, "b");
-  assert.match(fails[0].reason, /没有.*回答|未自动回复/);
+test("bindReply:没有待回复时原样返回,不报错", () => {
+  const s = session("me", [member("peer")]);
+  const r = bindReply(s, ["peer"]);
+  assert.equal(r.replyTo, null);
+  assert.equal(r.re, null);
+  assert.equal(r.hops, 0);
 });
 
-test("缺口 3:settle 之后队列清空,下一轮不重复发", () => {
-  const s = session("me", [member("a")]);
-  const n = handleIncoming(s, { from: "a", id: "req-a", re: null, body: { text: "来自 a" } });
-  runTurns(s, [[n.find((x) => x.type === "inject").payload, "回答"]]);
+test("observeMessage:自定义消息按 customType 认出来并标记 seen", () => {
+  const s = session("me", [member("peer")]);
+  rememberPending(s, { from: "peer", id: "req-1", hops: 0, ref: "队友消息原文" });
+  assert.equal(s.pendingReplies[0].seen, false);
 
-  assert.equal(onTurnSettled(s).filter((x) => x.type === "send").length, 1);
-  assert.equal(s.pendingReplies.length, 0, "队列应清空");
-  assert.deepEqual(onTurnSettled(s), [], "再 settle 不该重复发");
+  // 队友消息到达时 role 是 "custom",不是 "user" —— 实测的形状
+  observeMessage(s, "custom", "队友消息原文", TEAM_MESSAGE_TYPE);
+  assert.equal(s.pendingReplies[0].seen, true, "确认模型看到了它");
+
+  // 别的 customType 不该误伤
+  const s2 = session("me", [member("peer")]);
+  rememberPending(s2, { from: "peer", id: "r", hops: 0, ref: "x" });
+  observeMessage(s2, "custom", "x", "subagent-notify");
+  assert.equal(s2.pendingReplies[0].seen, false, "别人的自定义消息不该算队友消息");
 });
 
-test("缺口 3:announce=off 时队列直接清掉,不发也不留", () => {
-  const s = session("me", [member("a")], { announce: "off" });
-  handleIncoming(s, { from: "a", id: "req-a", re: null, body: { text: "来自 a" } });
-  assert.equal(s.pendingReplies.length, 1);
-
-  assert.deepEqual(onTurnSettled(s), []);
-  assert.equal(s.pendingReplies.length, 0);
-});
-
-test("缺口 3:队列有上限,超出的出失败卡片而不是静默丢弃", () => {
-  const peers = Array.from({ length: 40 }, (_, i) => member(`p${i}`));
-  const s = session("me", peers);
-
-  for (let i = 0; i < 40; i++) {
-    handleIncoming(s, { from: `p${i}`, id: `req-${i}`, re: null, body: { text: `来自 p${i}` } });
-  }
-
-  assert.ok(s.pendingReplies.length <= 32, `队列不应超过上限,实际 ${s.pendingReplies.length}`);
+test("observeMessage:assistant 文本记进 lastText,供 announce=always 用", () => {
+  const s = session();
+  observeMessage(s, "assistant", "这一轮的输出");
+  assert.equal(s.lastText, "这一轮的输出");
 });
 
 test("缺口 3:重复投递同一 id 只注入一次", () => {
@@ -429,7 +365,11 @@ test("对话形状:新请求 → 卡片 + 注入 + 设置待回复", () => {
   assert.match(actions[1].payload, /\[来自 peer 的 team 消息\]/);
   assert.equal(s.pendingReplies.length, 1);
   assert.equal(s.pendingReplies[0].re, "req-x", "re 指向入站消息 id,用于回信时闭合");
-  assert.equal(s.pendingReplies[0].payload, actions[1].payload, "入队的 payload 必须和注入给 Pi 的完全一致,否则绑不上回答");
+  assert.equal(
+    s.pendingReplies[0].ref,
+    actions[1].payload,
+    "入队的 ref 必须和注入的 payload 完全一致,否则 message_end 里认不出它",
+  );
 });
 
 test("对话形状:fyi 广播只出卡片", () => {
@@ -461,44 +401,70 @@ test("对话形状:announce=always 推出 fyi,且不设待回复", () => {
   assert.ok(actions.every((a) => a.hops === 1));
 });
 
-test("对话形状回归:旧行为(回复也自动回信)会打到跳数上限", () => {
-  // 对照组:用完整的 handleIncoming / onTurnSettled 走一遍两个会话。
-  // 关键是方向 —— 收到消息的那一方跑轮次并回信,不是发送方。
-  function run(firstOrigin) {
-    const nodes = { A: session("A", [member("B")]), B: session("B", [member("A")]) };
-    const wire = [];
+test("对话形状:一来一回之后停下来,不会互相触发下去", () => {
+  // 走完整链路:A 发请求 → B 收到(自定义消息)→ B 显式回复 → A 收到回复,
+  // 到此为止。两个 agent 互相触发会一直打下去。
+  const nodes = { A: session("A", [member("B")]), B: session("B", [member("A")]) };
+  const wire = [];
 
-    const first = sendMessage(nodes.A, { to: "B", text: "原始提问", origin: firstOrigin });
-    const sa = first.find((a) => a.type === "send");
-    wire.push({ to: "B", env: { from: "A", id: sa.id, re: null, body: { text: "原始提问", hops: 0 } } });
+  const first = sendMessage(nodes.A, { to: "B", text: "原始提问", origin: "model" });
+  const sa = first.find((a) => a.type === "send");
+  wire.push({ to: "B", env: { from: "A", id: sa.id, re: null, body: { text: "原始提问", hops: 0 } } });
 
-    for (let i = 0; i < wire.length && i < 20; i++) {
-      const msg = wire[i];
-      const receiver = nodes[msg.to];
-      const actions = handleIncoming(receiver, msg.env);
+  for (let i = 0; i < wire.length && i < 10; i++) {
+    const msg = wire[i];
+    const receiver = nodes[msg.to];
+    const actions = handleIncoming(receiver, msg.env);
 
-      // 按 Pi 实际发出的事件模拟:注入的 payload 以 user 消息出现,
-      // 随后才是 assistant 的回答。旧写法直接赋 lastText,跳过了绑定,
-      // 会让这个对照组测不到真实路径。
-      const injected = actions.find((a) => a.type === "inject");
-      if (injected) observeMessage(receiver, "user", injected.payload);
-      observeMessage(receiver, "assistant", `answer-${i}`);
-      receiver.lastText = `answer-${i}`;
+    const injected = actions.find((a) => a.type === "inject");
+    if (!injected) break;
 
-      for (const a of onTurnSettled(receiver)) {
-        if (a.type === "send") {
-          wire.push({
-            to: a.to,
-            env: { from: receiver.self, id: a.id, re: a.re, body: { text: a.text, hops: a.hops } },
-          });
-        }
-      }
+    // Pi 实际发出的事件:自定义消息 role="custom"
+    observeMessage(receiver, "custom", injected.payload, TEAM_MESSAGE_TYPE);
+    observeMessage(receiver, "assistant", `answer-${i}`);
+
+    // 只有"请求"才需要回复。收到回复时不再回 —— 这才是对话能停下来的原因,
+    // 而不是靠跳数上限兜住。
+    const cls = classifyInbound(receiver, msg.env);
+    if (!cls.autoReply) continue;
+
+    const bound = bindReply(receiver, [receiver === nodes.B ? "A" : "B"]);
+    wire.push({
+      to: msg.env.from,
+      env: {
+        from: receiver.self,
+        id: `out-${i}`,
+        re: bound.re,
+        // 跳数在 body 里,不在信封顶层 —— 契约就是这么定的
+        body: { text: `answer-${i}`, hops: bound.hops },
+      },
+    });
+
+    // settle 不该自己产生任何 send
+    for (const a of onTurnSettled(receiver)) {
+      assert.notEqual(a.type, "send", "settle 不再自动发消息");
     }
-    return wire.length;
   }
 
-  assert.equal(run("model"), 2, "模型发起的请求:一来一回共 2 条");
-  assert.equal(run("user"), 2, "用户发起的请求:同样 2 条,不该有第二条回复");
+  assert.equal(wire.length, 2, "请求 + 回复,共 2 条就该停");
+  const reply = wire[1].env;
+  assert.equal(reply.re, sa.id, "回复要带上原请求的 id,对端才认得出是回复");
+  assert.equal(reply.body.hops, 1, "跳数随回复递增");
+
+  // A 收到回复后不该再产生新的消息
+  const aActions = handleIncoming(nodes.A, reply);
+  assert.equal(aActions.some((a) => a.type === "send"), false, "收到回复后不该再自动回复");
+  assert.equal(nodes.A.pendingReplies.length, 0, "回复不该进待回复队列");
+});
+
+test("一来一回:回复不会把接收方拖进新的待回复", () => {
+  // 这是循环能否终止的关键。若回复也进队列,双方就会一直互相催下去。
+  const s = session("A", [member("B")]);
+  const out = sendMessage(s, { to: "B", text: "我方提问", origin: "model" });
+  const id = out.find((a) => a.type === "send").id;
+
+  handleIncoming(s, { from: "B", id: "reply-1", re: id, body: { text: "对方的答复", hops: 1 } });
+  assert.equal(s.pendingReplies.length, 0, "收到回复不应要求我们再回复");
 });
 
 // ================================================================ 杂项
@@ -512,7 +478,8 @@ test("extractText:字符串与内容数组", () => {
 
 test("buildPayload:请求与回复措辞不同", () => {
   const req = buildPayload("p", "任务", { kind: "request" });
-  assert.match(req, /会自动原样回传/);
+  assert.match(req, /【不会】自动回传/, "要明确说回传不是自动的 —— 以前说会,现在不会了");
+  assert.match(req, /team_send\(\{ to: "p"/, "要告诉它具体怎么回复,收件人直接填好");
 
   const rep = buildPayload("p", "答复", { kind: "reply", original: "原来的问题" });
   assert.match(rep, /【不会】自动回传/);
@@ -585,19 +552,18 @@ test("@label 群发能命中经 tags 映射来的节点", () => {
  *
  * 这组测试把契约钉在生产者一侧:send 意图必须在顶层带 text 和 hops。
  */
-test("契约:onTurnSettled 的 send 意图在顶层带 text 和 hops", () => {
+test("契约:auto 模式下 onTurnSettled 不再替模型发回信", () => {
+  // 以前 settle 时把某段文本当成回复自动发出去。实测模型会在同一 run 里
+  // 先回应队友、再做完原任务,按段落猜归属会把原任务的收尾发给队友。
+  // 现在回复由模型显式调 team_send 发出,settle 只负责提醒。
   const s = session("me", [member("peer")]);
-  s.pendingReplies = [pending("peer", { re: "req-1", text: "回复内容" })];
-  s.lastText = "回复内容";
+  rememberPending(s, { from: "peer", id: "req-1", hops: 0, ref: "p" });
+  s.pendingReplies[0].seen = true;
+  s.lastText = "这是原任务的收尾,不该被当成给 peer 的回复";
 
-  const [send] = onTurnSettled(s);
-  assert.equal(send.type, "send");
-  assert.equal(send.text, "回复内容", "text 必须在顶层 —— index.ts 靠它组装 body");
-  assert.equal(typeof send.hops, "number");
-  assert.equal(send.hops, 1);
-  assert.equal(send.re, "req-1");
-  assert.equal(send.id, undefined === send.id ? undefined : send.id, "id 由生产者生成");
-  assert.ok(send.id, "send 意图必须自带 id");
+  const actions = onTurnSettled(s);
+  assert.equal(actions.some((a) => a.type === "send"), false, "不能自动发送");
+  assert.equal(actions[0].type, "remind");
 });
 
 test("契约:announce=always 的 send 意图同样带 text / hops / fyi", () => {
@@ -627,7 +593,7 @@ test("契约:所有 send 意图都不使用 body 字段(由调用方组装)", ()
   const s = session("me", [member("peer")]);
   s.lastText = "x";
 
-  const fromSettled = onTurnSettled({ ...s, pendingReplies: [pending("peer", { text: "x" })] });
+  const fromSettled = onTurnSettled({ ...s, announce: "always", lastText: "x" });
   const fromSend = sendMessage(s, { to: "peer", text: "y", origin: "user" });
 
   for (const a of [...fromSettled, ...fromSend].filter((x) => x.type === "send")) {

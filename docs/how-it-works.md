@@ -60,48 +60,99 @@ status` says so rather than pretending otherwise.
 
 ```
 A → B   request   (no re)
-          B runs a turn, its output goes back to A automatically
+          B's model sees it and answers with team_send
 
 B → A   reply     (re = A's request id)
-          A shows the reply. It does NOT auto-answer, so the exchange ends.
-
-A(model) → B ...    if A wants to continue, its model calls team_send explicitly
+          A's model sees it. Nothing is sent back, so the exchange ends.
 ```
 
-Rules, enforced by `src/policy.js` and covered by tests:
+Rules, covered by tests:
 
 | Inbound | Action |
 |---|---|
-| Request (`re` empty) | Inject into the model; auto-reply once |
-| Reply to something the **model** sent | Inject, with the original quoted; no auto-reply |
+| Request (`re` empty) | Deliver into the model's context; reply expected |
+| Reply to something the **model** sent | Deliver, with the original quoted; no reply expected |
 | Reply to something **you** sent via `/team send` | Card only — the model never saw your message, so waking it would confuse it |
-| Reply whose original is unknown (e.g. after a restart) | Inject; no auto-reply |
+| Reply whose original is unknown (e.g. after a restart) | Deliver; no reply expected |
 | `fyi` broadcast (`announce=always`) | Card only |
+
+### Delivery, and why not `followUp`
+
+A teammate's message arrives as a custom message (`pi.sendMessage`), not as a
+user message. That is not cosmetic — `sendUserMessage` only accepts `steer` or
+`followUp`, and `followUp` **ends the current run**:
+
+```
+227163ms  assistant ""            the original task had not finished
+227165ms  agent_end               the run was cut short here
+227168ms  agent_start             a new run begins
+227169ms  user "<teammate msg>"   treated as a new instruction from the user
+```
+
+The original task was left half-done and never sent its closing message.
+
+`sendMessage` behaves differently. Measured on a run doing three tool calls:
+
+```
+ 94687ms  user "call slowwork three times, then reply FULLDONE"
+103686ms  --- teammate message arrives while the first tool is running ---
+111711ms  message_end role=custom text="<teammate msg>"   queued to the next turn
+134544ms  assistant "Got <teammate msg>. The first slowwork call..."
+150032ms  assistant "FULLDONE"                             the original task finished
+```
+
+The running tool call was not interrupted, the original task completed and
+reported back, and the model saw the teammate message at the start of the next
+turn. `steer` semantics, without needing `sendUserMessage`.
+
+Two other measured properties:
+
+- Two `sendMessage` calls in the same synchronous tick both reach the model.
+  `sendUserMessage` loses the second one — which is why an injection queue
+  existed for a while; `sendMessage` made it unnecessary.
+- `display: false` still enters the model's context, so the transcript card and
+  the model-visible payload are drawn independently.
+
+Because delivery no longer lines up with run boundaries, "which output is the
+reply" cannot be inferred. A run that answers a teammate and then finishes its
+own task produces two assistant messages, and only the first is the reply:
+
+```
+111711ms  message_end role=custom text="TICKPROBE-BUSY"
+134544ms  assistant "Got TICKPROBE-BUSY. The first slowwork c..."
+150032ms  assistant "FULLDONE"
+```
+
+Sending the last one to the peer would be answering the wrong question. So the
+model replies explicitly with `team_send`; the settle boundary only checks for
+unanswered requests and reminds once. `bindReply` links an explicit reply to the
+pending request automatically, carrying its `re` and incrementing `hops` — a
+reply sent without `re` would look like a new request to the other side, and the
+two agents would keep triggering each other until the hop limit stopped them.
 
 Messages carry a hop count and stop at 4. That is a backstop, not the mechanism —
 the shape above is what actually terminates a conversation.
 
 ### Concurrent requests
 
-Two peers sending at almost the same moment each get their own answer.
+Several teammates can send at once, and each one is delivered. There is no
+queue with a fixed capacity that silently drops the overflow: every message
+gets its own custom message into the model's context.
 
-A follow-up opens its own turn, so Pi's event stream looks like this:
+What can happen is that a request arrives while the model is busy and is still
+unanswered when the run ends. It is not lost — it is queued into the next turn —
+but nothing will have answered it by then. At the settle boundary each pending
+request is checked:
 
-```
-agent_start
-  turn: user "request A" → assistant "answer to A"
-  turn: user "request B" → assistant "answer to B"
-agent_end → agent_settled
-```
+- not yet seen by the model → leave it; the queued message will trigger the next
+  turn on its own
+- seen but unanswered → remind once, with the original request attached
+- reminded once already → stop, and say so locally
 
-Injected user messages come back verbatim on `message_end`, so an answer is
-bound to its request by matching that payload. Two requests in one turn share
-one answer, which is correct — the model saw both at once. Every reply still
-carries its own `re` and `hops`, because that is routing, not text.
-
-Anything that cannot be matched to an answer reports failure to the sender
-rather than substituting another request's text. Sending someone an unrelated
-answer is worse than telling them it did not work.
+The last case is deliberate. Continuing to remind would mean an agent that
+decided a message needed no answer gets nagged forever; staying silent would let
+the sender wait for a reply that is never coming. Reporting it locally tells the
+human which of the two happened.
 
 ## Connecting: the three entry points
 
@@ -261,11 +312,15 @@ Each of these was a real bug found by testing, not a preference:
 - **`agent_settled` carries no `messages` field.** Accumulate assistant text on
   `message_end`; the settled event only has `{ type }`.
 
-- **`ctx.isIdle()` is not a reliable "can I inject" test.** It still reports
-  idle in the same tick as a previous injection, so a second message took the
-  direct path and Pi rejected it with *"Agent is already processing a prompt"* —
-  the request vanished. `index.ts` tracks run state from `before_agent_start` to
-  `agent_settled` instead.
+- **`sendUserMessage` is the wrong tool for a teammate's message.** It only
+  offers `steer` and `followUp`; `followUp` ends the current run and leaves the
+  original task half-done, and two calls in the same synchronous tick lose the
+  second one silently (both calls return success). `sendMessage` with a custom
+  type has neither problem. See [Delivery](#delivery-and-why-not-followup).
+
+- **A custom message arrives as `role: "custom"`, not `"user"`.** Code that
+  recognised injected messages by looking for a user message stopped matching
+  the moment delivery changed. They are now recognised by `customType`.
 
 - **Don't frame every inbound message as an assigned task.** Telling the model
   "this is a task, execute it" fixes passivity but breaks peer conversation — a

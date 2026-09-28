@@ -14,6 +14,7 @@
  */
 
 import {
+  bindReply,
   knownLabels,
   others as othersOf,
   parseRecipients,
@@ -108,14 +109,14 @@ export function dispatch(input, state, env) {
 
     case "send":
     case "say":
-      return sendResult(args, state, env);
+      return sendResult(args, state, env, input);
 
     case "announce":
       return announceResult(args, state);
 
     case "on":
       state.announce = "auto";
-      return ok(["announce=auto(收到请求后自动回一次)"]);
+      return ok(["announce=auto(请求没被回复时提醒一次)"]);
 
     case "off":
       state.announce = "off";
@@ -162,7 +163,7 @@ function statusLines(state, env) {
 
   lines.push(
     `在线       ${teamSize(state)} 个节点(${othersOf(state).length} 个其他节点)`,
-    `自动回信   ${state.announce}`,
+    `回信提醒   ${state.announce}`,
     `已存 team  ${listTeams().join(", ") || "(无)"}`,
   );
   return lines;
@@ -463,12 +464,16 @@ function labelResult(args, state, env) {
 
 // ---------------------------------------------------------------- send
 
-function sendResult(args, state, env) {
+function sendResult(args, state, env, input = {}) {
   const rawTo = args[0];
   const text = args.slice(1).join(" ");
   if (!rawTo || !text) return bad("用法:/team send <名字|@分组|*|@default|a,b> <内容>");
 
-  return sendMessage(rawTo, text, "user", state, env);
+  // origin 以前写死成 "user",连 team_send 工具也是 —— 于是模型发出的消息
+  // 被记成人发的,对方回复时只显示卡片,模型永远看不到那条回复。
+  // 工具路径在 index.ts 里传 origin:"model"。
+  const origin = input.origin === "model" ? "model" : "user";
+  return sendMessage(rawTo, text, origin, state, env);
 }
 
 /**
@@ -510,14 +515,22 @@ export function doSend(to, text, origin, local, state, env) {
   // 记下 origin:对方回复时靠它判断"模型知道这回事吗"
   state.outbound.set(id, { text, origin, to });
 
-  return ok([`已发给 ${formatTarget(to)}(${local.targets.length} 个节点)`], {
+  // 发给一个正有待回复请求的队友 → 认成对那条请求的回复。
+  // 带上 re,对端才知道这是回复、不该再自动回信;不带的话两个 agent
+  // 会互相触发下去,只能靠跳数上限兜住。
+  const { replyTo, re, hops } = bindReply(state, local.targets);
+
+  const lines = [`已发给 ${formatTarget(to)}(${local.targets.length} 个节点)`];
+  if (replyTo) lines.push(`(作为对 ${replyTo} 那条请求的回复)`);
+
+  return ok(lines, {
     intentions: [
       // 契约(与 session.js 一致):send 意图用**顶层** text / hops,
       // 由 index.ts 组装成信封的 body。
       // 曾经一边写 body:{text} 一边读 it.text,导致 /team send 发出
       // 空正文的消息 —— 对方只看到空字符串,症状是"投递成功但对方没反应"。
-      { type: "send", to, id, re: null, text, hops: 0 },
-      { type: "card", kind: "send", peer: formatTarget(to), text },
+      { type: "send", to, id, re, text, hops },
+      { type: "card", kind: replyTo ? "reply" : "send", peer: formatTarget(to), text },
     ],
   });
 }
@@ -537,5 +550,13 @@ function announceResult(args, state) {
     return bad(`当前 announce=${state.announce}。用法:/team announce <off|auto|always>`);
   }
   state.announce = mode;
-  return ok([`announce=${mode}`]);
+  // 三种模式的说明要跟着语义更新:auto 不再是"自动回信",
+  // 而是"请求没被回复时提醒一次"。
+  const note =
+    mode === "off"
+      ? "不再提醒 —— 消息照常送达,是否需要回复完全由模型决定"
+      : mode === "auto"
+        ? "请求没得到回复时提醒一次(回复仍由模型显式用 team_send 发出)"
+        : "每轮输出都镜像给所有节点(fyi,不叫醒对方)";
+  return ok([`announce=${mode}`, note]);
 }
