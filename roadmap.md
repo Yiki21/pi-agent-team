@@ -460,14 +460,37 @@ Implement `SwimTransport`: SWIM for membership, direct connections for messages.
 Decide first between a hand-written implementation and a sidecar built on an
 existing library such as memberlist.
 
-Benchmark with lightweight simulated nodes, not real Pi sessions, at 25, 100,
-500 and 1,000 nodes. Measure membership convergence time, failure detection
-latency, bandwidth, CPU and memory, and compare with broker and mesh at the
-sizes where all three run.
+**Done — sidecar chosen, implemented, conformance passed.**
 
-Exit criteria: passes the conformance suite. The benchmark report says at what
-team size, if any, SWIM beats the other modes, and the default mode follows that
-result.
+`swim/` is a Go sidecar on `hashicorp/memberlist`. Go because SWIM's hard parts
+(incarnation numbers, suspicion timeouts, indirect ping requests) only misbehave
+when something is already wrong, and a failure detector that is subtly wrong
+causes the roster to be distrusted. memberlist is what Consul and Kubernetes
+ship. `SwimTransport` takes membership from the sidecar and reuses mesh's
+connection layer for delivery, so delivery cannot diverge between the two modes.
+
+Passes the same conformance suite as broker and mesh. Verified live across three
+TUI nodes, including discovery, labels, graceful leave, SIGKILL detection via
+suspicion timeout, and a node with a different token being invisible (the gossip
+key derives from the team token).
+
+Two things the work surfaced:
+
+- Members must advertise their *delivery* port through memberlist's Meta.
+  SWIM's own announcement carries the gossip port; without the extra field the
+  member table knows a name and has no way to reach it.
+- Mesh needed an `externalMembership` mode. If it kept running its own discovery
+  alongside the sidecar, the two disagreed and dead nodes lingered in the view.
+
+**Not done — the benchmark.** Still to run: lightweight simulated nodes (not
+real Pi sessions) at 25 / 100 / 500 / 1,000, measuring membership convergence,
+failure detection latency, bandwidth, CPU and memory, against broker and mesh at
+the sizes where all three run.
+
+Exit criteria: conformance suite passes — **met**. The benchmark report says at
+what team size, if any, SWIM beats the other modes, and the default mode follows
+that result — **not met**; `broker` remains the default, which is the honest
+choice while the data is missing rather than a claim that SWIM is worse.
 
 ### Phase 6, group-aware large clusters
 
