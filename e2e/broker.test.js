@@ -660,3 +660,68 @@ test("绑一个本机没有的地址:退出码 78,提示用 tailscale IP", async
   assert.match(out, /tailscale ip/, "要提示最常见的正确写法");
   assert.equal(/at Server\.setupListenHandle/.test(out), false, "不该有原始堆栈");
 });
+
+// ---------------------------------------------------------------- 消息过大
+//
+// 以前 broker 直接 socket.destroy():发送方只看到 close 1006,和网线被拔
+// 一模一样。用户会去查网络和防火墙,而实际原因是文本太长。
+
+test("消息过大:broker 以 1009 关闭并说明原因,不是裸断开", async (t) => {
+  const h = await withBroker(t);
+  // 收件人必须在线,否则消息会在地址解析那步就被判 undeliverable、
+  // 根本走不到帧读取 —— 第一版测试就栽在这儿(它实际测的是"收件人不存在")。
+  await h.connect("big-target");
+
+  const env = JSON.stringify({
+    from: "big-sender",
+    to: "big-target",
+    id: "big-1",
+    re: null,
+    body: { text: "字".repeat(22000), hops: 0 },
+  });
+  assert.ok(Buffer.byteLength(env) > 65536, `前置条件:信封必须真的超限,实际 ${Buffer.byteLength(env)} 字节`);
+
+  const closed = await new Promise((resolve, reject) => {
+    const ws = new WebSocket(`${h.base}/?name=big-sender&token=${TOKEN}&host=h`);
+    const timer = setTimeout(() => reject(new Error("等关闭超时")), 10000);
+    ws.onopen = () => ws.send(env);
+    ws.onclose = (ev) => {
+      clearTimeout(timer);
+      resolve({ code: ev.code, reason: ev.reason });
+    };
+    ws.onerror = () => {};
+  });
+
+  assert.equal(closed.code, 1009, "应使用 1009(消息过大),而不是 1006");
+  assert.match(closed.reason, /too large|payload/i, "要带上原因,否则对端无从判断");
+});
+
+test("消息过大:只断那一条,重连后照常可用", async (t) => {
+  const h = await withBroker(t);
+  await h.connect("recover-target");
+
+  await new Promise((resolve) => {
+    const ws = new WebSocket(`${h.base}/?name=recover&token=${TOKEN}&host=h`);
+    ws.onopen = () =>
+      ws.send(
+        JSON.stringify({ from: "recover", to: "recover-target", id: "x", re: null, body: { text: "字".repeat(22000), hops: 0 } }),
+      );
+    ws.onclose = () => resolve();
+    ws.onerror = () => {};
+  });
+
+  // 同一个名字重连,后面的正常消息应照常送达
+  const got = await new Promise((resolve) => {
+    const ws = new WebSocket(`${h.base}/?name=recover&token=${TOKEN}&host=h`);
+    const t2 = setTimeout(() => resolve(false), 8000);
+    ws.onopen = () => ws.send(JSON.stringify({ from: "recover", to: "recover-target", id: "ok-1", re: null, body: { text: "小消息", hops: 0 } }));
+    ws.onmessage = (ev) => {
+      if (JSON.parse(ev.data).body?.kind === "delivered") {
+        clearTimeout(t2);
+        resolve(true);
+      }
+    };
+    ws.onerror = () => {};
+  });
+  assert.equal(got, true, "超限只该断那一次,不该影响后续连接");
+});

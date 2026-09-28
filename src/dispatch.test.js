@@ -189,25 +189,75 @@ test("doSend:确认后走同一条发送路径", () => {
   assert.deepEqual(intentTypes(r), ["send", "card"]);
 });
 
-// ---------------------------------------------------------------- announce
+// ---------------------------------------------------------------- reply
 
-test("announce:合法值都接受,非法值报错并显示当前值", () => {
+test("reply:三个模式都接受", () => {
   const c = setup();
-  for (const m of ["off", "auto", "always"]) {
-    assert.equal(run("announce", [m], c).ok, true);
-    assert.equal(c.state.announce, m);
+  for (const m of ["off", "remind", "mirror"]) {
+    const r = run("reply", [m], c);
+    assert.equal(r.ok, true, m);
+    assert.equal(c.state.reply, m);
+    assert.ok(r.lines[0].includes(m), "要回显当前值");
   }
-  const bad = run("announce", ["sometimes"], c);
-  assert.equal(bad.ok, false);
-  assert.match(bad.error, /always/);
 });
 
-test("on / off 是 announce 的简写", () => {
+test("reply:非法值报错并列出可用值", () => {
+  const c = setup();
+  const bad = run("reply", ["sometimes"], c);
+  assert.equal(bad.ok, false);
+  assert.match(bad.error, /remind/);
+  assert.match(bad.error, /mirror/);
+});
+
+test("reply:不带参数时显示当前值和三种模式的说明", () => {
+  const r = run("reply", [], setup());
+  assert.equal(r.ok, true);
+  const text = r.lines.join("\n");
+  for (const m of ["off", "remind", "mirror"]) assert.match(text, new RegExp(m));
+});
+
+test("reply:旧名字 auto / always 仍然可用,并说明改名了", () => {
+  // 改名不该让已经写好的启动脚本或肌肉记忆失效。旧名字映射到新名字,
+  // 并且明确告诉用户现在叫什么 —— 静默接受会让人一直用旧名字。
+  const c = setup();
+
+  const auto = run("reply", ["auto"], c);
+  assert.equal(auto.ok, true);
+  assert.equal(c.state.reply, "remind");
+  assert.ok(auto.lines.some((l) => /remind/.test(l) && /旧名字|现在叫/.test(l)), `要说明改名:${auto.lines}`);
+
+  const always = run("reply", ["always"], c);
+  assert.equal(always.ok, true);
+  assert.equal(c.state.reply, "mirror");
+  assert.ok(always.lines.some((l) => /mirror/.test(l) && /旧名字|现在叫/.test(l)));
+});
+
+test("announce 作为子命令名保留为别名", () => {
+  // /team announce always 以前很常用,直接删掉太粗暴
+  const c = setup();
+  const r = run("announce", ["always"], c);
+  assert.equal(r.ok, true);
+  assert.equal(c.state.reply, "mirror");
+});
+
+test("normalizeReplyMode:新旧名字都能识别", async () => {
+  const { normalizeReplyMode } = await import("./dispatch.js");
+  assert.deepEqual(normalizeReplyMode("off"), { mode: "off", legacy: false });
+  assert.deepEqual(normalizeReplyMode("remind"), { mode: "remind", legacy: false });
+  assert.deepEqual(normalizeReplyMode("mirror"), { mode: "mirror", legacy: false });
+  assert.deepEqual(normalizeReplyMode("auto"), { mode: "remind", legacy: true });
+  assert.deepEqual(normalizeReplyMode("always"), { mode: "mirror", legacy: true });
+  assert.deepEqual(normalizeReplyMode("nonsense"), { mode: null, legacy: false });
+  assert.deepEqual(normalizeReplyMode(""), { mode: null, legacy: false });
+  assert.deepEqual(normalizeReplyMode(undefined), { mode: null, legacy: false });
+});
+
+test("on / off 是 reply 的简写", () => {
   const c = setup();
   run("on", [], c);
-  assert.equal(c.state.announce, "auto");
+  assert.equal(c.state.reply, "remind");
   run("off", [], c);
-  assert.equal(c.state.announce, "off");
+  assert.equal(c.state.reply, "off");
 });
 
 // ---------------------------------------------------------------- label
@@ -422,7 +472,7 @@ test("契约:两个生产者的 send 意图字段集一致", async () => {
   applyRoster(s, { members: [{ name: "me", labels: [], host: null, addr: null, since: 0 }, { name: "peer", labels: [], host: null, addr: null, since: 0 }] });
   // auto 模式下 settle 不再产出 send(回复改由模型显式调 team_send),
   // 所以用 always 模式 —— 它是 settle 仍会产出 send 的那条路径。
-  s.announce = "always";
+  s.reply = "mirror";
   s.lastText = "y";
   const fromSession = onTurnSettled(s).find((i) => i.type === "send");
   assert.ok(fromSession, "前置条件:always 模式应产出 send");
@@ -650,4 +700,45 @@ test("send:没有待回复时照常作为新消息发出", () => {
   const send = r.intentions.find((i) => i.type === "send");
   assert.equal(send.re, null);
   assert.equal(send.hops, 0);
+});
+
+// ---------------------------------------------------------------- 消息体积
+
+test("oversizeBy:正常文本不报,超限才报", async () => {
+  const { oversizeBy, ENVELOPE_HEADROOM } = await import("./dispatch.js");
+
+  assert.equal(oversizeBy("短消息"), null);
+  assert.equal(oversizeBy(""), null);
+  assert.equal(oversizeBy("a".repeat(60000)), null, "6 万字节仍在限内");
+
+  const over = oversizeBy("a".repeat(66000));
+  assert.ok(over, "应报超限");
+  assert.ok(over.bytes >= 66000);
+  assert.ok(over.limit > 0);
+  assert.ok(ENVELOPE_HEADROOM > 0, "要留出信封其余字段的余量");
+});
+
+test("oversizeBy:按字节而不是字符算 —— 中文比英文早得多就超限", async () => {
+  const { oversizeBy } = await import("./dispatch.js");
+  // 一个汉字 3 字节。20000 字 = 60000 字节,勉强够;24000 字 = 72000 就超了。
+  assert.equal(oversizeBy("字".repeat(20000)), null);
+  assert.ok(oversizeBy("字".repeat(24000)), "按字符算会漏掉这种情况");
+});
+
+test("send:超长消息在本地就被拒,不会去碰连接", () => {
+  const c = setup();
+  const r = run("send", ["peer", "字".repeat(24000)], c);
+
+  assert.equal(r.ok, false, "本地就该失败");
+  assert.match(r.error, /太长|太大/);
+  assert.match(r.error, /拆|几条/, "要给出可操作的建议");
+  assert.deepEqual(r.intentions, [], "不该产出任何 send 意图");
+});
+
+test("send:超长检查先于连接状态 —— 没连接时也报体积问题", () => {
+  // 报"未连接"会把人引向错误方向:真正的问题是文本太长。
+  const c = setup({ connState: "offline" });
+  const r = run("send", ["peer", "字".repeat(24000)], c);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /太长|太大/, "体积问题是本地可判断的,不该被连接状态掩盖");
 });

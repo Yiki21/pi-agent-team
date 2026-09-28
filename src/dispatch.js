@@ -77,7 +77,7 @@ const newId = () => `m-${Date.now().toString(36)}-${PROC_TAG}-${(idSeq++).toStri
  * 主分发。
  *
  * @param {{ sub: string, args: string[] }} input
- * @param {import("./session.js").SessionState} state  读写:只改 announce / selfLabels / outbound
+ * @param {import("./session.js").SessionState} state  读写:只改 reply / selfLabels / outbound
  * @param {{ connState: string, team: string|null, config: {url,token,labels?}|null, host?: string }} env
  * @returns {Result}
  */
@@ -111,16 +111,18 @@ export function dispatch(input, state, env) {
     case "say":
       return sendResult(args, state, env, input);
 
+    // reply 是现在的名字;announce 保留为别名,免得已有的肌肉记忆失效
+    case "reply":
     case "announce":
-      return announceResult(args, state);
+      return replyResult(args, state, sub);
 
     case "on":
-      state.announce = "auto";
-      return ok(["announce=auto(请求没被回复时提醒一次)"]);
+      state.reply = "remind";
+      return ok(["reply=remind(请求没被回复时提醒一次)"]);
 
     case "off":
-      state.announce = "off";
-      return ok(["announce=off(只在 /team send 或 team_send 时发送)"]);
+      state.reply = "off";
+      return ok(["reply=off(不提醒,发不发由模型自己决定)"]);
 
     default:
       return bad(`未知子命令 "${sub}"。直接运行 /team 打开菜单。`);
@@ -163,7 +165,7 @@ function statusLines(state, env) {
 
   lines.push(
     `在线       ${teamSize(state)} 个节点(${othersOf(state).length} 个其他节点)`,
-    `回信提醒   ${state.announce}`,
+    `回信策略   ${state.reply}`,
     `已存 team  ${listTeams().join(", ") || "(无)"}`,
   );
   return lines;
@@ -508,7 +510,39 @@ export function sendMessage(rawTo, text, origin, state, env) {
 /**
  * 真正发出。确认过群发之后也走这里,避免两条路径。
  */
+/**
+ * 消息是否超过一帧能装下的体积。
+ *
+ * ── 为什么在发送前就查 ──
+ * 实测:超限时发送侧没有任何本地报错 —— socket.send 接受它,broker 读到
+ * 长度头就断开连接,发送方只看到 close 1006,和网线被拔一模一样。
+ * 用户会去查网络、防火墙、地址,而真正的原因是文本太长。
+ *
+ * 在本地拦住可以:保住连接、给出可操作的错误(让模型把内容拆短),
+ * 而且三种 transport 都受益。
+ *
+ * 估算用顶层信封的字节数。body 之外还有 from/to/id/re 这些字段,
+ * 所以这里留一点余量 —— 宁可稍微早报,也不要漏过去把连接搞断。
+ */
+export const ENVELOPE_HEADROOM = 512;
+
+export function oversizeBy(text) {
+  const frameLimit = 64 * 1024;
+  const bytes = Buffer.byteLength(String(text ?? ""), "utf8");
+  const total = bytes + ENVELOPE_HEADROOM;
+  return total > frameLimit ? { bytes, limit: frameLimit, total } : null;
+}
+
 export function doSend(to, text, origin, local, state, env) {
+  // 先查体积再查连接:超长是本地就能判断的问题,不该依赖连接状态
+  const over = oversizeBy(text);
+  if (over) {
+    return bad(
+      `消息太长,发不出去:${over.bytes} 字节(单条上限约 ${over.limit - ENVELOPE_HEADROOM} 字节)。` +
+        `把它拆成几条,或者改成让对端自己去读文件。`,
+    );
+  }
+
   if (env.connState !== "online") return bad("未连接,消息没发出去");
 
   const id = newId();
@@ -542,21 +576,47 @@ function formatTarget(to) {
   return String(to).replace(/^#/, "@");
 }
 
-// ---------------------------------------------------------------- announce
+// ---------------------------------------------------------------- reply
 
-function announceResult(args, state) {
-  const mode = args[0];
-  if (mode !== "off" && mode !== "auto" && mode !== "always") {
-    return bad(`当前 announce=${state.announce}。用法:/team announce <off|auto|always>`);
+/** 旧的模式名映射到新的,别让已有脚本静默失效 */
+const REPLY_ALIASES = { auto: "remind", always: "mirror" };
+const REPLY_MODES = ["off", "remind", "mirror"];
+
+export function normalizeReplyMode(raw) {
+  const v = String(raw ?? "").trim();
+  if (REPLY_MODES.includes(v)) return { mode: v, legacy: false };
+  if (REPLY_ALIASES[v]) return { mode: REPLY_ALIASES[v], legacy: true };
+  return { mode: null, legacy: false };
+}
+
+function replyResult(args, state, sub = "reply") {
+  const raw = args[0];
+  if (!raw) {
+    return ok([
+      `当前 reply=${state.reply}`,
+      "",
+      "  off     不提醒 —— 消息照常送达,回不回由模型自己决定",
+      "  remind  请求没被回复时提醒一次(回复仍由模型显式用 team_send 发出)",
+      "  mirror  每轮输出都镜像给所有节点(fyi,不叫醒对方)",
+      "",
+      `用法:/team ${sub} <off|remind|mirror>`,
+    ]);
   }
-  state.announce = mode;
-  // 三种模式的说明要跟着语义更新:auto 不再是"自动回信",
-  // 而是"请求没被回复时提醒一次"。
+
+  const { mode, legacy } = normalizeReplyMode(raw);
+  if (!mode) {
+    return bad(`模式只能是 ${REPLY_MODES.join(" / ")},实际 "${raw}"。当前 reply=${state.reply}`);
+  }
+
+  state.reply = mode;
   const note =
     mode === "off"
-      ? "不再提醒 —— 消息照常送达,是否需要回复完全由模型决定"
-      : mode === "auto"
-        ? "请求没得到回复时提醒一次(回复仍由模型显式用 team_send 发出)"
+      ? "不提醒 —— 消息照常送达,是否需要回复完全由模型决定"
+      : mode === "remind"
+        ? "请求没得到回复时提醒一次"
         : "每轮输出都镜像给所有节点(fyi,不叫醒对方)";
-  return ok([`announce=${mode}`, note]);
+
+  const lines = [`reply=${mode}`, note];
+  if (legacy) lines.push(`(旧名字 "${raw}" 仍可用,但现在叫 "${mode}")`);
+  return ok(lines);
 }

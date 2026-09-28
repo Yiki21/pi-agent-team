@@ -46,7 +46,7 @@ const MAX_PENDING_REPLIES = 32;
  * @typedef {{ text: string, origin: "user"|"model", to: string|string[] }} Outbound
  * @typedef {{ seen: Set<string>, injected: Set<string>, outbound: Map<string, Outbound>,
  *             members: Member[], self: string, selfLabels: string[],
- *             announce: "off"|"auto"|"always",
+ *             reply: "off"|"remind"|"mirror",
  *             pendingReplies: PendingReply[], lastText: string }} SessionState
  *
  * @typedef {{ to: string, re: string, hops: number, at: number,
@@ -76,7 +76,7 @@ export function createSessionState(self = "") {
     self,
     /** 本节点自己的标签。broker 需要它来解析 @label 群发。 */
     selfLabels: [],
-    announce: "auto",
+    reply: "remind",
     /**
      * 已收到、但还没有得到回复的队友请求。
      *
@@ -97,7 +97,7 @@ export function createSessionState(self = "") {
      * team_send 显式回复,这里只负责跟踪"谁还没被回复",必要时提醒一次。
      */
     pendingReplies: [],
-    /** 上一轮的输出文本,供 announce=always 镜像用 */
+    /** 上一轮的输出文本,供 reply=mirror 镜像用 */
     lastText: "",
     lastText: "",
   };
@@ -295,7 +295,7 @@ function formatTarget(to) {
  *   - 回复我们的消息   → 注入,**不回信**(否则请求→回复→回复…打到跳数上限)
  *   - 回复用户的消息   → 只显示卡片(模型没见过那条消息,叫醒它只会说"正文是空的")
  *   - 回复但原消息未知 → 注入,不回信
- *   - fyi 广播        → 只显示卡片(announce=always 的镜像推送,不该叫醒模型)
+ *   - fyi 广播        → 只显示卡片(reply=mirror 的镜像推送,不该叫醒模型)
  */
 export function classifyInbound(s, env) {
   const body = env.body ?? {};
@@ -486,13 +486,13 @@ export const TEAM_MESSAGE_TYPE = "team-msg";
  * compaction、queued continuation,拿它当"结束"会推中间态。
  */
 export function onTurnSettled(s) {
-  if (s.announce === "off") {
+  if (s.reply === "off") {
     s.pendingReplies = [];
     s.lastText = "";
     return [];
   }
 
-  if (s.announce === "always") {
+  if (s.reply === "mirror") {
     const text = s.lastText;
     if (!text.trim()) return [];
     s.lastText = "";

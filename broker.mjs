@@ -21,8 +21,8 @@
  */
 
 import { createServer } from "node:http";
-import { createHash, timingSafeEqual } from "node:crypto";
-import { FrameReader, encodeFrame, closeFrame, pingFrame, pongFrame } from "./src/ws.js";
+import { createHash } from "node:crypto";
+import { FrameReader, MAX_PAYLOAD, encodeFrame, closeFrame, pingFrame, pongFrame, tokenEquals } from "./src/ws.js";
 
 // ------------------------------------------------------------------ 参数
 
@@ -90,11 +90,10 @@ const peers = new Map();
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const fingerprint = createHash("sha256").update(TOKEN).digest("hex").slice(0, 8);
 
+/** 常数时间比较,和 mesh 共用同一个实现(见 src/ws.js 的 tokenEquals) */
 function tokenOk(presented) {
-  const a = Buffer.from(presented ?? "");
-  const b = Buffer.from(TOKEN);
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
+  if (presented == null) return false;
+  return tokenEquals(presented, TOKEN);
 }
 
 function write(socket, obj) {
@@ -462,6 +461,22 @@ server.on("upgrade", (req, socket) => {
     try {
       reader.feed(chunk);
     } catch (err) {
+      if (err?.code === "PAYLOAD_TOO_LARGE") {
+        // 发 1009(消息过大)并附原因,而不是直接 destroy。
+        //
+        // 以前这里一律 destroy:发送方只看到 close 1006,和网络断开无法区分,
+        // 用户会去查网络和防火墙。1009 + 原因让对端能明确说"消息太大"。
+        //
+        // 连接还是得断:我们已经读了部分帧、不知道剩下的字节在哪里结束,
+        // 继续读下去帧边界会错位。
+        log(`${name} 消息过大:${err.size} 字节 > ${MAX_PAYLOAD} —— 以 1009 关闭`);
+        try {
+          socket.end(closeFrame(1009, `message too large: ${err.size} > ${MAX_PAYLOAD} bytes`));
+        } catch {
+          socket.destroy();
+        }
+        return;
+      }
       log(`${name} 帧错误:${err.message} —— 断开`);
       socket.destroy();
     }

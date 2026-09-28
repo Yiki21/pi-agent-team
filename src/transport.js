@@ -25,6 +25,9 @@
 /** broker 用这个关闭码表示"你被同名的新连接顶掉了"。 */
 export const CLOSE_REPLACED = 4001;
 
+/** 对端说"消息太大"。见 broker.mjs 里帧超限的处理。 */
+export const CLOSE_TOO_LARGE = 1009;
+
 /**
  * 握手失败后探测 token 是否正确。
  *
@@ -209,6 +212,18 @@ export function createBrokerTransport({ url, token, WebSocketImpl = WebSocket })
         // 另一个同名节点接管了。继续重连只会互相顶来顶去。
         stopped = true;
         setState("replaced", { name: self?.name });
+        return;
+      }
+
+      if (ev.code === CLOSE_TOO_LARGE) {
+        // 对端拒绝了这条消息并主动关闭。重连是有意义的 —— 连接恢复正常,
+        // 只是那条消息不该再发。所以报告原因,然后照常重连。
+        //
+        // 本地检查(dispatch 的 oversizeBy)应该在更早的地方就拦住它;
+        // 走到这里说明信封比估算的还大,或者对端用的是另一个上限。
+        bus.emit("rejected", { reason: "too_large", detail: ev.reason ?? null });
+        setState("offline", { code: ev.code, reason: "payload_too_large", detail: ev.reason ?? null });
+        scheduleReconnect();
         return;
       }
 

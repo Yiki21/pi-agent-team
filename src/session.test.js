@@ -247,7 +247,7 @@ test("observeMessage:自定义消息按 customType 认出来并标记 seen", () 
   assert.equal(s2.pendingReplies[0].seen, false, "别人的自定义消息不该算队友消息");
 });
 
-test("observeMessage:assistant 文本记进 lastText,供 announce=always 用", () => {
+test("observeMessage:assistant 文本记进 lastText,供 reply=mirror 用", () => {
   const s = session();
   observeMessage(s, "assistant", "这一轮的输出");
   assert.equal(s.lastText, "这一轮的输出");
@@ -392,8 +392,8 @@ test("对话形状:跳数到上限丢弃", () => {
   assert.deepEqual(actions, []);
 });
 
-test("对话形状:announce=always 推出 fyi,且不设待回复", () => {
-  const s = session("me", [member("a"), member("b")], { announce: "always", lastText: "广播内容" });
+test("对话形状:reply=mirror 推出 fyi,且不设待回复", () => {
+  const s = session("me", [member("a"), member("b")], { reply: "mirror", lastText: "广播内容" });
   const actions = onTurnSettled(s);
 
   assert.equal(actions.length, 2);
@@ -566,8 +566,8 @@ test("契约:auto 模式下 onTurnSettled 不再替模型发回信", () => {
   assert.equal(actions[0].type, "remind");
 });
 
-test("契约:announce=always 的 send 意图同样带 text / hops / fyi", () => {
-  const s = session("me", [member("a")], { announce: "always", lastText: "广播内容" });
+test("契约:reply=mirror 的 send 意图同样带 text / hops / fyi", () => {
+  const s = session("me", [member("a")], { reply: "mirror", lastText: "广播内容" });
   const [send] = onTurnSettled(s);
 
   assert.equal(send.type, "send");
@@ -593,7 +593,7 @@ test("契约:所有 send 意图都不使用 body 字段(由调用方组装)", ()
   const s = session("me", [member("peer")]);
   s.lastText = "x";
 
-  const fromSettled = onTurnSettled({ ...s, announce: "always", lastText: "x" });
+  const fromSettled = onTurnSettled({ ...s, reply: "mirror", lastText: "x" });
   const fromSend = sendMessage(s, { to: "peer", text: "y", origin: "user" });
 
   for (const a of [...fromSettled, ...fromSend].filter((x) => x.type === "send")) {

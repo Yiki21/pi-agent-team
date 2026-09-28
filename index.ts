@@ -32,6 +32,7 @@ import { Type } from "typebox";
 import { createBrokerTransport, CLOSE_REPLACED } from "./src/transport.js";
 import { MODES, createTransport, modeReadiness, normalizeSeeds, resolveMode } from "./src/mode.js";
 import { createSessionState, handleIncoming, knownLabels, newId, onTurnSettled, observeMessage, others, teamSize, applyRoster, TEAM_MESSAGE_TYPE } from "./src/session.js";
+import { normalizeReplyMode } from "./src/dispatch.js";
 import { createTeam, joinTeam, leaveTeam, listTeams, readTeam, toSocketUrl } from "./src/team-config.js";
 import { BULK_WARN_THRESHOLD, dispatch, doSend, sendMessage } from "./src/dispatch.js";
 
@@ -440,6 +441,19 @@ function connectWith(
       );
     } else if (next === "auth_failed") {
       ctxRef?.ui.notify(tokenFailureMessage(detail as { reason?: string; fingerprint?: string | null; url?: string }), "error");
+    } else if (next === "offline" && (detail as { reason?: string })?.reason === "payload_too_large") {
+      const d = detail as { detail?: string | null };
+      ctxRef?.ui.notify(
+        [
+          "team:消息太大,对端拒绝了它并关闭了连接。",
+          d.detail ? `  对端说明:${d.detail}` : "",
+          "",
+          "连接会自动重连,但这条消息不会补发 —— 请把内容拆短,或让对端自己读文件。",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        "error",
+      );
     } else if (next === "offline" && (detail as { code?: number })?.code === CLOSE_REPLACED) {
       ctxRef?.ui.notify("team:连接被同名实例顶替", "warning");
     }
@@ -510,7 +524,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerFlag("team-mode", { description: "投递模式:broker | mesh | swim", type: "string" });
   pi.registerFlag("team-seeds", { description: "mesh/swim 的种子地址,逗号分隔", type: "string" });
   pi.registerFlag("team-url", { description: "broker 模式的 URL(不读 team 配置)", type: "string" });
-  pi.registerFlag("team-announce", { description: "回信提醒模式:off | auto | always", type: "string" });
+  pi.registerFlag("team-reply", { description: "回信策略:off | remind | mirror", type: "string" });
 
   // ---- 生命周期
   pi.on("session_start", async (_event, ctx) => {
@@ -525,9 +539,31 @@ export default function (pi: ExtensionAPI) {
     const labels = (pi.getFlag("team-labels") as string) ?? process.env.TEAM_LABELS ?? "";
     state.selfLabels = labels.split(",").map((s) => s.trim()).filter(Boolean);
 
-    const announce = (pi.getFlag("team-announce") as string) ?? process.env.TEAM_ANNOUNCE;
-    if (announce === "off" || announce === "auto" || announce === "always") state.announce = announce;
-    else if (process.env.TEAM_QUIET === "1") state.announce = "off";
+    // 回信策略。旧名字(TEAM_ANNOUNCE / --team-announce / auto / always)
+    // 继续可用,读到就说一声 —— 改名不该让已写好的启动脚本静默失效。
+    const rawReply =
+      (pi.getFlag("team-reply") as string) ??
+      (pi.getFlag("team-announce") as string) ??
+      process.env.TEAM_REPLY ??
+      process.env.TEAM_ANNOUNCE;
+
+    if (rawReply) {
+      const { mode, legacy } = normalizeReplyMode(rawReply);
+      if (mode) {
+        state.reply = mode;
+        if (legacy) {
+          ctx.ui.notify(
+            `team:回信策略的旧名字 "${rawReply}" 仍可用,但现在叫 "${mode}"。` +
+              `新写法:TEAM_REPLY=${mode} 或 --team-reply ${mode}`,
+            "warning",
+          );
+        }
+      } else {
+        ctx.ui.notify(`team:认不出的回信策略 "${rawReply}",可以用:off / remind / mirror`, "warning");
+      }
+    } else if (process.env.TEAM_QUIET === "1") {
+      state.reply = "off";
+    }
 
     const team = (pi.getFlag("team") as string) ?? process.env.TEAM ?? "";
     const url = (pi.getFlag("team-url") as string) ?? process.env.TEAM_URL ?? "";
@@ -940,7 +976,7 @@ export default function (pi: ExtensionAPI) {
     description: "Pi Agent Team:状态 / 成员 / 发送 / team 生命周期 / 标签",
     getArgumentCompletions(prefix) {
       const subs = [
-        "status", "peers", "create", "join", "leave", "mode", "label", "send", "announce", "on", "off",
+        "status", "peers", "create", "join", "leave", "mode", "label", "send", "reply", "on", "off",
       ];
       if (!prefix.includes(" ")) {
         return subs.filter((s) => s.startsWith(prefix)).map((s) => ({ value: s, label: s, description: `/team ${s}` }));
@@ -1005,8 +1041,8 @@ export default function (pi: ExtensionAPI) {
         return completeToken(["broker", "mesh", "swim"].map((m) => ({ option: m })));
       }
 
-      if (sub === "announce") {
-        return ["off", "auto", "always"]
+      if (sub === "reply" || sub === "announce") {
+        return ["off", "remind", "mirror"]
           .filter((m) => m.startsWith(partial))
           .map((m) => ({ value: m, label: m }));
       }
@@ -1245,15 +1281,15 @@ export default function (pi: ExtensionAPI) {
         },
       },
       {
-        label: `🔔 回信提醒模式  (当前:${state.announce})`,
+        label: `🔔 回信策略  (当前:${state.reply})`,
         run: async () => {
-          const pick = await ctx.ui.select("announce 模式", [
-            "off  —  只手动发送,不提醒",
-            "auto  —  请求没被回复时提醒一次",
-            "always  —  每轮输出都镜像给所有节点(两边都开会互相刷屏)",
+          const pick = await ctx.ui.select("回信策略", [
+            "off  —  不提醒,回不回由模型自己决定",
+            "remind  —  请求没被回复时提醒一次",
+            "mirror  —  每轮输出都镜像给所有节点(两边都开会互相刷屏)",
           ]);
           if (!pick) return;
-          const r = await invoke({ sub: "announce", args: [pick.split(" ")[0]] }, ctx);
+          const r = await invoke({ sub: "reply", args: [pick.split(" ")[0]] }, ctx);
           if (!r.ok) ctx.ui.notify(r.error!, "error");
         },
       },

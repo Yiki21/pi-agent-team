@@ -222,3 +222,69 @@ test("[mesh] stop() 之后端口释放", async (t) => {
   assert.equal(again.state(), "online");
   again.stop();
 });
+
+// ---------------------------------------------------------------- token 边界
+//
+// mesh 以前用 `!==` 比较 token,而 broker 用 timingSafeEqual —— 同一个
+// token 在两种 transport 下强度不同。现在两边共用 tokenEquals。
+//
+// 这里补的是长度不同的情况:旧写法会在长度不等时提前返回,
+// 而"比较了多久"本身就能泄露 token 长度。
+
+test("[mesh] token 是对方的前缀 / 对方是它的前缀,都该被拒", async (t) => {
+  const h = await meshHarness(t);
+  const good = await h.create({ name: "prefix-guard" });
+
+  // 标签必须是 ASCII:mesh 把节点名放进 x-team-name 头,而 Node 的
+  // setHeader 拒绝非 ASCII 字符(见本文件末尾关于节点名的那个测试)。
+  for (const [label, tok] of [
+    ["shorter", TOKEN.slice(0, -1)],
+    ["longer", `${TOKEN}x`],
+    ["much-longer", TOKEN.repeat(10)],
+  ]) {
+    const bad = createMeshTransport({
+      token: tok,
+      seeds: [`127.0.0.1:${good.transport.port()}`],
+      listenHost: "127.0.0.1",
+      listenPort: 0,
+    });
+    bad.start({ name: `near-${label}`, labels: [], host: null });
+    await new Promise((r) => setTimeout(r, 900));
+    bad.stop();
+
+    assert.equal(
+      good.transport.members().some((m) => m.name === `near-${label}`),
+      false,
+      `token ${label} 不该通过`,
+    );
+  }
+});
+
+test("[mesh] 空 token 不能通过非空 token 的节点", async (t) => {
+  const h = await meshHarness(t);
+  const good = await h.create({ name: "empty-guard" });
+
+  const bad = createMeshTransport({
+    token: "",
+    seeds: [`127.0.0.1:${good.transport.port()}`],
+    listenHost: "127.0.0.1",
+    listenPort: 0,
+  });
+  bad.start({ name: "empty-token", labels: [], host: null });
+  await new Promise((r) => setTimeout(r, 1200));
+  bad.stop();
+
+  assert.equal(
+    good.transport.members().some((m) => m.name === "empty-token"),
+    false,
+    "空 token 不该被接受",
+  );
+});
+
+test("[mesh] 正确 token 仍然能连上(改动没有把好的一起挡掉)", async (t) => {
+  const h = await meshHarness(t);
+  const a = await h.create({ name: "ok-a" });
+  const b = await h.create({ name: "ok-b" });
+  await waitFor(() => a.transport.members().some((m) => m.name === "ok-b"));
+  assert.ok(true, "正确 token 的双向发现仍正常");
+});

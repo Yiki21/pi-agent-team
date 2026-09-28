@@ -8,12 +8,46 @@
  * 服务端发帧不加掩码(RFC 强制),收帧必须解掩码(客户端强制)。
  */
 
+import { createHash, timingSafeEqual } from "node:crypto";
+
 const OP_CONT = 0x0;
 const OP_TEXT = 0x1;
 const OP_BIN = 0x2;
 const OP_CLOSE = 0x8;
 const OP_PING = 0x9;
 const OP_PONG = 0xa;
+
+/**
+ * 常数时间的 token 比较。
+ *
+ * ── 为什么要哈希再比 ──
+ * 直接 `timingSafeEqual(bufA, bufB)` 在长度不同时会抛错,所以常见写法是
+ * 先比长度、不同就提前 return —— 但那个提前返回本身泄露了长度信息,
+ * 而且比较在第一个不同的字节处就可能提前结束。
+ *
+ * 两边都做一次 sha256 之后,长度恒定(32 字节),比较全程走完:
+ * 攻击者从响应时间上读不出任何关于 token 的信息。
+ *
+ * broker 和 mesh 都用这个函数。以前 broker 用 timingSafeEqual 而 mesh 用
+ * 普通的 `!==` —— 同一个 token、两种强度,取决于你选了哪个 transport。
+ */
+export function tokenEquals(presented, expected) {
+  const a = createHash("sha256").update(String(presented ?? "")).digest();
+  const b = createHash("sha256").update(String(expected ?? "")).digest();
+  return timingSafeEqual(a, b);
+}
+
+/**
+ * 帧超过 MAX_PAYLOAD 时抛出的错误。带 code,调用方据此发 1009(消息过大)
+ * 而不是笼统地断开 —— 后者在发送方看来就是网络断了。
+ */
+export class PayloadTooLargeError extends Error {
+  constructor(size) {
+    super(`payload ${size} bytes exceeds ${MAX_PAYLOAD} bytes`);
+    this.code = "PAYLOAD_TOO_LARGE";
+    this.size = size;
+  }
+}
 
 /** 上限,防止对端用超大长度头耗内存。64 KiB 足够任何一条消息。 */
 export const MAX_PAYLOAD = 64 * 1024;
@@ -26,7 +60,7 @@ export const MAX_PAYLOAD = 64 * 1024;
 export function encodeFrame(text) {
   const data = Buffer.from(text, "utf8");
   if (data.length > MAX_PAYLOAD) {
-    throw new Error(`payload too large: ${data.length} > ${MAX_PAYLOAD}`);
+    throw new PayloadTooLargeError(data.length);
   }
 
   const len = data.length;
@@ -58,10 +92,17 @@ export function encodeControl(opcode, payload = Buffer.alloc(0)) {
   return Buffer.concat([Buffer.from([0x80 | opcode, payload.length]), payload]);
 }
 
-export const closeFrame = (code) => {
-  const p = Buffer.alloc(2);
-  p.writeUInt16BE(code ?? 1000, 0);
-  return encodeControl(OP_CLOSE, p);
+/**
+ * 关闭帧。可以带一句原因 —— RFC 允许把原因跟在 2 字节码后面。
+ *
+ * 原因对诊断很重要:1009(消息过大)如果不带原因,发送方只看到"连接被关",
+ * 和网络故障无法区分,于是在网络、防火墙、地址上白费功夫。
+ */
+export const closeFrame = (code, reason = "") => {
+  const codeBuf = Buffer.alloc(2);
+  codeBuf.writeUInt16BE(code ?? 1000, 0);
+  const reasonBuf = reason ? Buffer.from(String(reason).slice(0, 100), "utf8") : Buffer.alloc(0);
+  return encodeControl(OP_CLOSE, Buffer.concat([codeBuf, reasonBuf]));
 };
 export const pingFrame = () => encodeControl(OP_PING);
 export const pongFrame = () => encodeControl(OP_PONG);
@@ -122,7 +163,7 @@ export class FrameReader {
       if (buf.length < 10) return false;
       const big = buf.readBigUInt64BE(2);
       if (big > BigInt(MAX_PAYLOAD)) {
-        throw new Error(`declared payload ${big} exceeds cap`);
+        throw new PayloadTooLargeError(Number(big));
       }
       len = Number(big);
       off = 10;
@@ -181,7 +222,7 @@ export class FrameReader {
           const whole = Buffer.concat(this.#fragments);
           this.#fragments = null;
           if (whole.length > MAX_PAYLOAD) {
-            throw new Error("reassembled payload exceeds cap");
+            throw new PayloadTooLargeError(whole.length);
           }
           this.#handlers.onText?.(whole.toString("utf8"));
         }

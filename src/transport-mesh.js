@@ -29,7 +29,7 @@
 
 import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import { createHash } from "node:crypto";
-import { FrameReader, encodeFrame, closeFrame, pingFrame, pongFrame } from "./ws.js";
+import { FrameReader, encodeFrame, closeFrame, pingFrame, pongFrame, tokenEquals } from "./ws.js";
 import { createEmitter } from "./transport.js";
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -86,6 +86,27 @@ export function resolveTargets(to, selfName, memberList) {
 
   targets.delete(selfName);
   return [...targets];
+}
+
+/**
+ * 喂帧,出错时按错误类型关闭。
+ *
+ * 超限走 1009 + 原因:对端能明确知道"消息太大"。其余帧错误(协议违规、
+ * 畸形帧)直接断开 —— 那种情况下对端不值得被礼貌对待,而且帧边界已经
+ * 不可信,继续读会错位。
+ */
+function feedOrClose(reader, sock, chunk) {
+  try {
+    reader.feed(chunk);
+  } catch (err) {
+    if (err?.code === "PAYLOAD_TOO_LARGE") {
+      try {
+        sock.end(closeFrame(1009, `message too large: ${err.size} bytes`));
+        return;
+      } catch {}
+    }
+    sock.destroy();
+  }
 }
 
 export function createMeshTransport({
@@ -420,14 +441,8 @@ export function createMeshTransport({
           onClose: () => sock.end(closeFrame(1000)),
         });
 
-        if (head?.length) reader.feed(head);
-        sock.on("data", (chunk) => {
-          try {
-            reader.feed(chunk);
-          } catch {
-            sock.destroy();
-          }
-        });
+        if (head?.length) feedOrClose(reader, sock, head);
+        sock.on("data", (chunk) => feedOrClose(reader, sock, chunk));
         sock.on("close", () => {
           socket = null;
           linkState = "offline";
@@ -463,7 +478,10 @@ export function createMeshTransport({
     };
 
     if ((req.headers.upgrade ?? "").toLowerCase() !== "websocket") return reject(400, "Bad Request");
-    if (req.headers["x-team-token"] !== token) return reject(401, "Unauthorized");
+    // 常数时间比较。以前这里是 `!==`,而 broker 用的是 timingSafeEqual ——
+    // 同一个 token 在两种 transport 下强度不同。
+    const presented = req.headers["x-team-token"];
+    if (typeof presented !== "string" || !tokenEquals(presented, token)) return reject(401, "Unauthorized");
 
     const key = req.headers["sec-websocket-key"];
     if (typeof key !== "string") return reject(400, "Bad Request");
@@ -511,13 +529,7 @@ export function createMeshTransport({
       onClose: () => socket.end(closeFrame(1000)),
     });
 
-    socket.on("data", (chunk) => {
-      try {
-        reader.feed(chunk);
-      } catch {
-        socket.destroy();
-      }
-    });
+    socket.on("data", (chunk) => feedOrClose(reader, socket, chunk));
     socket.on("error", () => {});
     socket.on("close", () => {
       if (realName && inbound.get(realName)?.socket === socket) inbound.delete(realName);

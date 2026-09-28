@@ -170,6 +170,20 @@ same options as `/team join`.
 | `port` | mesh/swim listening port (0 = pick one) | no |
 | `listen` | mesh/swim listening address | no |
 
+Reply behaviour is a separate setting, not a connection option:
+
+| `reply` | What it does |
+|---|---|
+| `off` | Never reminds. Messages still arrive; answering is the model's call |
+| `remind` *(default)* | Reminds once when a request goes unanswered |
+| `mirror` | Mirrors every turn's output to all nodes as `fyi` (both sides on means both keep posting) |
+
+Set it with `reply=` / `TEAM_REPLY` / `--team-reply`, or `/team reply <mode>` at
+runtime. The older names still work: `TEAM_ANNOUNCE`, `--team-announce`,
+`/team announce`, and the values `auto` (now `remind`) and `always` (now
+`mirror`). Using one prints a note saying what it is called now — `auto` and
+`always` no longer describe what the mode does, which is why they were renamed.
+
 The last four are not saved because one machine can run several Pi agents and
 they share one config file. Saving the name would have the second agent
 overwrite the first; saving the port would have it try to listen on a port

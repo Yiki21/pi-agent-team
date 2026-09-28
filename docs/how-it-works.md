@@ -74,7 +74,7 @@ Rules, covered by tests:
 | Reply to something the **model** sent | Deliver, with the original quoted; no reply expected |
 | Reply to something **you** sent via `/team send` | Card only — the model never saw your message, so waking it would confuse it |
 | Reply whose original is unknown (e.g. after a restart) | Deliver; no reply expected |
-| `fyi` broadcast (`announce=always`) | Card only |
+| `fyi` broadcast (`reply=mirror`) | Card only |
 
 ### Delivery, and why not `followUp`
 

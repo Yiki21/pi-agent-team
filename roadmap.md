@@ -538,6 +538,24 @@ otherwise answers "your message had an empty body".
 
 ## 15. Open questions
 
+**A rejected name looks like a dead network.** `NAME_RE` accepts only ASCII, and
+a name outside it is refused during the handshake. But Node's built-in WebSocket
+hides the HTTP status of a failed handshake, so all the client sees is
+`error` with an empty message and close `1006` — identical to unplugging the
+cable. Measured: connecting with the name `中文节点` produces exactly that, while
+the broker log shows the refusal.
+
+This is the same shape as the token-mismatch problem that `/auth` was added to
+solve, and it wants the same treatment: a reason the client can report, rather
+than a bare transport failure. Two candidate approaches: carry the refusal in
+the close frame with a reason (the way `1009` now reports an oversized message),
+or add a diagnostic endpoint like `/auth` that the client calls once after a
+failed handshake. The first is cleaner; the second already has a working
+precedent.
+
+Until it is fixed, a non-ASCII name is a silent connection failure from the
+user's point of view.
+
 **`team_id` on the wire.** Needed only if one broker should serve several teams.
 Recommendation: leave it out of v1. Add a `team` field in a later version if the
 need appears.
