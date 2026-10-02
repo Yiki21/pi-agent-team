@@ -42,31 +42,38 @@ function allocPort() {
  *   sent    我们发出的信封 + 最终结果(send 后在收到回执时回填 outcome)
  */
 async function brokerHarness(t, { noTakeover = false } = {}) {
-  const port = await allocPort();
-  const url = `ws://127.0.0.1:${port}`;
+  const url = "ws://127.0.0.1";
 
+  // --port 0 lets the kernel pick a free port, and the broker reports the one it
+  // actually bound. Previously this allocated a port by listening on 0, closing, and
+  // handing the number to the child — a TOCTOU window another parallel test could win,
+  // which surfaced as the broker exiting 78 (EX_CONFIG/EADDRINUSE).
   const broker = spawn(
     process.execPath,
-    [BROKER, "--bind", "127.0.0.1", "--port", String(port), "--heartbeat", "3000"],
+    [BROKER, "--bind", "127.0.0.1", "--port", "0", "--heartbeat", "3000"],
     {
       env: { ...process.env, TEAM_TOKEN: TOKEN, ...(noTakeover ? { TEAM_NO_TAKEOVER: "1" } : {}) },
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
 
+  let port;
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("broker 启动超时")), 8000);
     broker.stdout.on("data", (d) => {
-      if (d.toString().includes("broker 监听")) {
-        clearTimeout(timer);
-        resolve();
-      }
+      const m = /broker 监听 ws:\/\/[^:]+:(\d+)/.exec(d.toString());
+      if (!m) return;
+      port = Number(m[1]);
+      clearTimeout(timer);
+      resolve();
     });
     broker.on("exit", (code) => {
       clearTimeout(timer);
       reject(new Error(`broker 提前退出 code=${code}`));
     });
   });
+
+  const wsUrl = `${url}:${port}`;
 
   const nodes = [];
 
@@ -76,7 +83,7 @@ async function brokerHarness(t, { noTakeover = false } = {}) {
     const sent = [];
     let replaced = false;
 
-    const transport = createBrokerTransport({ url, token: TOKEN });
+    const transport = createBrokerTransport({ url: wsUrl, token: TOKEN });
 
     transport.on("state", (s, detail) => {
       states.push(s);
@@ -155,7 +162,7 @@ async function brokerHarness(t, { noTakeover = false } = {}) {
   /** 模拟 broker 崩溃 / 网络断开 —— 已连上的节点会看到连接断掉 */
   const killBroker = () => broker.kill("SIGKILL");
 
-  return { url, create, teardown, killBroker };
+  return { url: wsUrl, create, teardown, killBroker };
 }
 
 // ---------------------------------------------------------------- 跑套件
@@ -184,6 +191,8 @@ test("[broker] 关掉接管时,同名连接被拒", async (t) => {
 });
 
 test("[broker] 未配置 token 时连接失败", async (t) => {
+  // 这里**故意**要一个没人在听的端口 —— 断言的就是"连不上"。
+  // 不需要 --port 0:端口被谁抢走都无所谓,被拒的连接结果一样。
   const port = await allocPort();
   const bad = createBrokerTransport({ url: `ws://127.0.0.1:${port}`, token: "wrong" });
   const states = [];

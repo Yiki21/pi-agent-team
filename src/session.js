@@ -99,7 +99,6 @@ export function createSessionState(self = "") {
     pendingReplies: [],
     /** 上一轮的输出文本,供 reply=mirror 镜像用 */
     lastText: "",
-    lastText: "",
   };
 }
 
@@ -135,12 +134,6 @@ export function knownLabels(s) {
   return [...out].sort();
 }
 
-/**
- * 应用 broker 推来的成员快照。
- *
- * 同时接受新格式(members,带元数据)和旧格式(peers,只有名字数组),
- * 因为 broker 可能先于扩展升级。
- */
 /**
  * 应用 broker 推来的成员快照。
  *

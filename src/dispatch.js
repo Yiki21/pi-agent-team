@@ -500,7 +500,11 @@ export function sendMessage(rawTo, text, origin, state, env) {
     to === "*" || to === "@default" || Array.isArray(to) || (typeof to === "string" && to.startsWith("@"));
   if (isBulk && local.targets.length > BULK_WARN_THRESHOLD) {
     return ok([`准备群发给 ${local.targets.length} 个节点:${local.targets.join(", ")}`], {
-      party: { kind: "confirmBulk", n: local.targets.length, to, text, origin },
+      // targets 必须带上。确认后重跑 doSend 时,bindReply 靠它判断"这条是不是在
+      // 回复某个待回复的请求",并据此决定 re/hops。上层的 confirmBulk 处理器拿不到
+      // 解析结果,只能自己编一个,而编出来的空名字会让 re 绑不上任何东西 ——
+      // 群发就不再受 hop 上限保护。
+      party: { kind: "confirmBulk", n: local.targets.length, targets: local.targets, to, text, origin },
     });
   }
 

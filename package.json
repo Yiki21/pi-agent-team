@@ -51,14 +51,16 @@
     "src/transport-mesh.js",
     "src/transport-swim.js",
     "src/transport.js",
-    "src/ws.js"
+    "src/ws.js",
+    "tsconfig.json"
   ],
   "scripts": {
-    "test": "node --test --test-timeout=30000 src/ e2e/",
+    "test": "npm run typecheck && node --test --test-timeout=30000 src/ e2e/",
     "test:unit": "node --test --test-timeout=30000 src/",
     "test:e2e": "node --test --test-timeout=30000 e2e/",
     "broker": "node broker.mjs",
-    "build:sidecar": "cd swim && go build -o ../.tmp/swim-sidecar ."
+    "build:sidecar": "cd swim && go build -o ../.tmp/swim-sidecar .",
+    "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
@@ -86,5 +88,12 @@
     "typebox": {
       "optional": true
     }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@earendil-works/pi-tui": "1.0.0",
+    "typebox": "^1.3.34",
+    "typescript": "^5.9.3",
+    "@types/node": "^24.10.0"
   }
 }

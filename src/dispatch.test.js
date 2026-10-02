@@ -742,3 +742,23 @@ test("send:超长检查先于连接状态 —— 没连接时也报体积问题"
   assert.equal(r.ok, false);
   assert.match(r.error, /太长|太大/, "体积问题是本地可判断的,不该被连接状态掩盖");
 });
+
+// ---------------------------------------------------------------- confirmBulk targets
+
+test("confirmBulk 带上解析好的 targets", () => {
+  // 群发确认后要重跑 doSend,bindReply 靠 targets 判断这条是不是在回复
+  // 某个待回复的请求(并据此决定 re/hops)。上层拿不到解析结果时只能自己编,
+  // 而编出来的空名字会让 re 绑不上任何东西 —— hop 上限就不再覆盖群发。
+  const peers = ["a", "b", "c", "d", "e", "f"].map((n) => member(n));
+  const c = setup({ peers });
+
+  const r = run("send", ["*", "hello"], c);
+  assert.equal(r.ok, true);
+  assert.equal(r.party?.kind, "confirmBulk");
+  assert.deepEqual(
+    [...r.party.targets].sort(),
+    ["a", "b", "c", "d", "e", "f"],
+    "party 必须携带真实的收件人列表,而不是让上层自己编",
+  );
+  assert.equal(r.party.n, 6);
+});

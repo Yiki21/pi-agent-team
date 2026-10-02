@@ -49,6 +49,11 @@ async function withBroker(t, { noTakeover = false, heartbeat = 2000 } = {}) {
   const base = `ws://127.0.0.1:${port}`;
   const sockets = [];
 
+  // 注:这里仍是"先探测再释放"的写法,只在这个文件里用。
+  // e2e/transport-broker.test.js 已经改成 --port 0 + 从启动行读回实际端口,
+  // 消除竞态;本文件没被观测到过失败,先不动它,但如果有天并发下报
+  // "broker 提前退出 code=78",这就是原因。
+
   const broker = spawn(
     process.execPath,
     [BROKER, "--bind", "127.0.0.1", "--port", String(port), "--heartbeat", String(heartbeat)],

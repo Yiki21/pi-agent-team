@@ -584,7 +584,15 @@ server.on("error", (err) => {
 });
 
 server.listen(args.port, args.bind, () => {
-  log(`broker 监听 ws://${args.bind}:${args.port}`);
+  // 报告**实际**绑定的端口,而不是请求的那个。
+  //
+  // --port 0 让内核分配一个空闲端口,这是测试免除"先探测再释放"竞态的唯一办法:
+  // 先 listen(0) 读出端口再关掉,然后把这个号码交给子进程,中间任何其他进程
+  // 都可能把它抢走(实测会,并行跑 e2e 时表现为 broker 以 78 退出)。
+  // 常规部署下两者相同,输出不变。
+  const bound = server.address();
+  const actualPort = typeof bound === "object" && bound ? bound.port : args.port;
+  log(`broker 监听 ws://${args.bind}:${actualPort}`);
   log(`token 指纹 ${fingerprint}(日志核对用,不是 token 本身)`);
   log(`接管模式 ${ALLOW_TAKEOVER ? "开(同名新连接踢旧连接)" : "关(同名返回 409)"}`);
 });

@@ -40,6 +40,9 @@ import { BULK_WARN_THRESHOLD, dispatch, doSend, sendMessage } from "./src/dispat
 
 type CardKind = "receive" | "send" | "reply" | "failed";
 
+/** 主题颜色名。写成字面量联合而不是 string —— 否则 theme.fg 类型不过 */
+type CardColor = "accent" | "success" | "error";
+
 type CardDetails = { kind: CardKind; peer: string; text: string; at: number; reason?: string };
 
 const CARD_TYPE = "team-message";
@@ -123,9 +126,15 @@ async function notifyInjectFailure(from: string, reason: string, ctx: ExtensionC
   // 让对端的 re 能对着一个我们没真正发过的请求。
   try {
     transport?.send({ to: from, id: newId(), re: null, body: { text, hops: 1, fyi: true } });
-  } catch {
-    // 连失败通知都发不出去就只留着本机 notify，不再递归上报
-    void ctx;
+  } catch (err) {
+    // 连失败通知都发不出去。以前这里只写了个注释什么都不做,于是发信人永远
+    // 等一条明知不可能来的回信。至少在本机说出来。
+    const msg = `team:注入失败的通知也没发出去(${(err as Error).message})`;
+    try {
+      ctx.ui.notify(msg, "warning");
+    } catch {
+      // ctx 也可能已经失效(session 正在关),那就只能放弃
+    }
   }
 }
 
@@ -247,17 +256,15 @@ async function runParty(party: Record<string, unknown> | undefined, ctx: Extensi
       return true;
 
     case "disconnect":
-      transport?.stop();
-      transport = null;
-      connState = "offline";
-      currentTeam = null;
-      currentConfig = null;
-      renderStatus();
+      teardownConnection();
       return true;
 
     case "reconnect": {
       const labels = party.labels as string[];
-      if (transport && currentConfig) connectWith(currentTeam, { ...currentConfig, labels });
+      // 不能无声成功:transport 还在但没有 config 时这里什么也没做,
+      // 却报告重连成功,用户以为连上了。
+      if (!transport || !currentConfig) return false;
+      connectWith(currentTeam, { ...currentConfig, labels });
       return true;
     }
 
@@ -271,9 +278,13 @@ async function runParty(party: Record<string, unknown> | undefined, ctx: Extensi
         ctx.ui.notify("已取消", "info");
         return false;
       }
-      // 确认后走同一条发送路径,不复制逻辑
+      // 确认后走同一条发送路径,不复制逻辑。
+      // targets 用 dispatch 解析好的真实收件人,不要自己编 —— bindReply 依赖它。
       const to = party.to as string | string[];
-      const local = { targets: new Array(n).fill("") as string[], unknown: [] };
+      const local = {
+        targets: (party.targets as string[]) ?? (new Array(n).fill("") as string[]),
+        unknown: [],
+      };
       const r = doSend(to, String(party.text), (party.origin as "user" | "model") ?? "user", local, state, envOf());
       if (!r.ok) {
         ctx.ui.notify(r.error!, "error");
@@ -363,9 +374,27 @@ function fingerprintOf(token: string): string {
 
 // ---------------------------------------------------------------- 连接
 
+/**
+ * 拆掉当前连接并清干净相关状态。
+ *
+ * /team disconnect 和 session_shutdown 都必须调它。以前两处各写一份,shutdown
+ * 那份漏掉了 connState / currentTeam / currentConfig / roster,于是新会话继承了
+ * 上一个会话的连接状态 —— 状态栏显示已连接但实际没有 transport,
+ * 而 renderStatus 也不会被调用来纠正。
+ */
+function teardownConnection(): void {
+  transport?.stop();
+  transport = null;
+  connState = "offline";
+  currentTeam = null;
+  currentConfig = null;
+  state.members = [];
+  renderStatus();
+}
+
 function connectWith(
   team: string | null,
-  config: { url?: string; token: string; labels?: string[]; mode?: string; seeds?: string[] },
+  config: { url: string; token: string; labels?: string[]; mode?: string; seeds?: string[] },
   /**
    * 会话级选项,来自这次调用的参数,覆盖启动时的值。
    *
@@ -492,7 +521,7 @@ export default function (pi: ExtensionAPI) {
     const kind: CardKind = d?.kind ?? "receive";
     const body = d?.text ?? "";
 
-    const meta: Record<CardKind, { icon: string; label: string; color: string; arrow: string }> = {
+    const meta: Record<CardKind, { icon: string; label: string; color: CardColor; arrow: string }> = {
       receive: { icon: "📥", label: "RECV", color: "accent", arrow: "←" },
       send: { icon: "📤", label: "SEND", color: "success", arrow: "→" },
       reply: { icon: "🔁", label: "REPLY", color: "success", arrow: "→" },
@@ -525,10 +554,22 @@ export default function (pi: ExtensionAPI) {
   pi.registerFlag("team-seeds", { description: "mesh/swim 的种子地址,逗号分隔", type: "string" });
   pi.registerFlag("team-url", { description: "broker 模式的 URL(不读 team 配置)", type: "string" });
   pi.registerFlag("team-reply", { description: "回信策略:off | remind | mirror", type: "string" });
+  // 旧名字,README 里承诺过仍然可用。必须真的注册:Pi 的 getFlag 对未注册的名字
+  // 无条件返回 undefined,不注册就等于命令行写法静默失效(而环境变量那一半还有效),
+  // 用哪种写法决定了行为却没有任何报错。
+  pi.registerFlag("team-announce", { description: "已改名:用 --team-reply", type: "string" });
 
   // ---- 生命周期
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     ctxRef = ctx;
+
+    // new / resume / fork 都是"新的一轮会话",上一个会话的成员表、待回复队列、
+    // 已发消息记录不能带过来。reload 是在同一会话上重载扩展,状态应当保留。
+    // 以前只重置 self / selfLabels / reply,于是 fork 之后会拿着上一个会话的
+    // pendingReplies 去提醒模型回复一条它从未见过的请求。
+    if ((event as { reason?: string })?.reason !== "reload") {
+      state = createSessionState(state.self);
+    }
 
     state.self =
       (pi.getFlag("team-name") as string) ??
@@ -611,9 +652,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    transport?.stop();
-    transport = null;
+    teardownConnection();
     ctxRef = null;
+    state = createSessionState(state.self);
   });
 
   pi.on("turn_start", async (_event, ctx) => {
@@ -646,6 +687,21 @@ export default function (pi: ExtensionAPI) {
   // 还没开始处理,Pi 会把它当普通 prompt,于是又落回"被后一条覆盖"的
   // 那个窗口。探针在 before_agent_start 与 agent_start 之间实测过。
   pi.on("agent_settled", async (_event, ctx) => {
+    ctxRef = ctx;
+    const actions = onTurnSettled(state);
+    void runIntentions(actions as unknown as Array<Record<string, unknown>>, ctx);
+  });
+
+  // 掉队的兵。
+  //
+  // agent_settled 只在干净收尾时触发;一轮以 abort 或 provider 错误结束时它不会来。
+  // 队长在那一轮里送到的请求于是永远进不了 onTurnSettled,也就永远不会被提醒 ——
+  // 它会一直挂着,直到这个进程里下一次干净收尾。
+  //
+  // onTurnSettled 自己会把 pendingReplies 清空,所以两个 handler 并存是幂等的:
+  // 先跑的那个清完了,后跑的就没什么可做的。
+  pi.on("agent_end", async (_event, ctx) => {
+    if (state.pendingReplies.length === 0) return;
     ctxRef = ctx;
     const actions = onTurnSettled(state);
     void runIntentions(actions as unknown as Array<Record<string, unknown>>, ctx);
@@ -688,7 +744,17 @@ export default function (pi: ExtensionAPI) {
       .filter((l) => l !== "")
       .join("\n");
 
-    return { systemPrompt: event.systemPrompt + note };
+    // 用 systemPromptOptions.sections 追加一个具名 section,不要返回整个 systemPrompt。
+    //
+    // 返回 systemPrompt 会替换掉这一轮的完整提示,而 Pi 的契约是"后面的 handler
+    // 看到的正是这个替换值"。于是排在我们后面的扩展(以及 Pi 自己在这一轮追加的
+    // 内容)全部被丢掉 —— 症状是另一个扩展的指令莫名消失,从外面极难定位。
+    // sections 是文档里的增量通道:后注册的 handler 会看到我们的修改。
+    event.systemPromptOptions.sections = {
+      ...event.systemPromptOptions.sections,
+      team: note,
+    };
+    return {};
   });
 
   // ---- 工具入口(给模型和自动化)
