@@ -22,6 +22,9 @@
  * (注入?回信?只显示卡片?)属于会话状态机,在 session.js。
  */
 
+/** 虚拟收件人:发给它 = "转给所有订阅我的人"。broker 侧同名。 */
+export const WATCH_RECIPIENT = "_watchers";
+
 /** broker 用这个关闭码表示"你被同名的新连接顶掉了"。 */
 export const CLOSE_REPLACED = 4001;
 
@@ -305,6 +308,39 @@ export function createBrokerTransport({ url, token, WebSocketImpl = WebSocket })
       } catch {
         return false;
       }
+    },
+
+    /**
+     * 订阅登记/注销。只 broker 模式有这东西。
+     *
+     * 返回 false 只意味着没连上,和 send 一样是尽力而为;真正的确认
+     * 是 broker 回发的 watch_ack。
+     */
+    sendWatch(action, target, id = `w-${Date.now().toString(36)}`) {
+      if (!socket || socket.readyState !== WebSocketImpl.OPEN) return false;
+      try {
+        socket.send(
+          JSON.stringify({
+            from: self?.name ?? "",
+            to: "broker",
+            id,
+            re: null,
+            body: { kind: "watch", action, ...(target ? { target } : {}) },
+          }),
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    },
+
+    /**
+     * 往 `_watchers` 发一条:让 broker 把它转给所有订阅了我的人。
+     * 心跳式的一次广播,不记录 outbound —— 它不是一次请求,
+     * 没人会回。
+     */
+    publishToWatchers(text, id = `p-${Date.now().toString(36)}`) {
+      return this.send({ to: WATCH_RECIPIENT, id, re: null, body: { text, hops: 1 } });
     },
 
     state: () => state,

@@ -273,6 +273,22 @@ from the sidecar.
 persist anything, but it is a single point of trust — only run it on a machine
 you control.
 
+**Subscriptions are one-sided, deliberately.** `/team watch add <node>` makes the
+broker copy that node's turn output to the subscriber. The watched node is never
+told: it receives no receipt, no acknowledgement, and a publish that nobody is
+watching returns `watch_none` rather than a count. So a node cannot detect that it
+is being watched, and cannot tell how many are watching.
+
+What this does **not** hide: a subscriber learns who the watched node was answering
+where the summary makes it obvious, and more importantly, anyone who watches a node
+sees what that node broadcasts. Publish nothing to `_watchers` that you would not
+say in front of the whole team — the recipient list is not a confidentiality
+boundary, it is a convenience.
+
+The subscription list lives in broker memory only, beside the peer table. It is
+never written to disk, and a broker restart drops it; subscribers re-register on
+reconnect.
+
 | | broker | mesh | swim |
 |---|---|---|---|
 | Who sees message plaintext | the broker too | only the two endpoints | only the two endpoints |

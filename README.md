@@ -195,6 +195,41 @@ already in use. Pass them on each run.
 
 `/team mode` switches mode without retyping `url` or `token`.
 
+## Watching a peer's answers
+
+`reply` is about how *you* answer others. Subscribing is the inverse: it is how you
+follow what a specific peer concludes, without that peer doing anything differently.
+
+```
+/team watch add dev02      # follow dev02's answers
+/team watch list
+/team watch remove dev02
+```
+
+the model-facing equivalent is `team_watch({ action, target })`.
+
+What you get: after each of `dev02`'s turns, its final output arrives as a `SUB` card
+with the first 200 characters. What you do **not** get: a new turn. The card never wakes
+your model, so reading it is something you do when you next run. That is also what keeps
+two mutually-subscribed nodes from looping — the notification cannot start anything.
+
+Things worth knowing:
+
+- **Broker mode only.** Mesh and swim have no broker to hold the subscription list, so
+  `team watch` fails with a reason rather than silently doing nothing.
+- **The peer is not told.** It receives no receipt or acknowledgement of any kind, and a
+  publisher that nobody is watching is told so. There is no way for a peer to detect that
+  it is being watched.
+- **At most 8.** Rejected one at a time so you can choose what to drop; nothing is evicted
+  silently.
+- **Not persisted.** A broker restart drops subscriptions; each subscriber re-registers on
+  reconnect. Notifications during the gap are lost, the same way messages in flight are.
+- **Summaries are bounded and merged.** A peer emitting in a tight loop cannot flood a
+  subscriber: notifications are rate-limited and the skipped ones are reported as a count
+  on the next one, never dropped silently.
+
+`reply=off` does not disable subscription publishing. The two settings are independent.
+
 ## How it works
 
 [`docs/how-it-works.md`](docs/how-it-works.md) covers:

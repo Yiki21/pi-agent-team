@@ -1,6 +1,6 @@
 {
   "name": "@yiki21/pi-agent-team",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Turn several machines running the Pi coding agent into one team over your tailnet. Three transports (broker / mesh / SWIM), one shared API and conformance suite.",
   "license": "MIT",
   "author": "Yiki21",
@@ -17,7 +17,9 @@
     "coding-agent",
     "swim",
     "memberlist",
-    "gossip"
+    "gossip",
+    "subscription",
+    "watch"
   ],
   "engines": {
     "node": ">=22"
@@ -52,7 +54,8 @@
     "src/transport-swim.js",
     "src/transport.js",
     "src/ws.js",
-    "tsconfig.json"
+    "tsconfig.json",
+    "src/watch.js"
   ],
   "scripts": {
     "test": "npm run typecheck && node --test --test-timeout=30000 src/ e2e/",

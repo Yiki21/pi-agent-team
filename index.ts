@@ -33,12 +33,13 @@ import { createBrokerTransport, CLOSE_REPLACED } from "./src/transport.js";
 import { MODES, createTransport, modeReadiness, normalizeSeeds, resolveMode } from "./src/mode.js";
 import { createSessionState, handleIncoming, knownLabels, newId, onTurnSettled, observeMessage, others, teamSize, applyRoster, TEAM_MESSAGE_TYPE } from "./src/session.js";
 import { normalizeReplyMode } from "./src/dispatch.js";
+import { describeWatches } from "./src/watch.js";
 import { createTeam, joinTeam, leaveTeam, listTeams, readTeam, toSocketUrl } from "./src/team-config.js";
 import { BULK_WARN_THRESHOLD, dispatch, doSend, sendMessage } from "./src/dispatch.js";
 
 // ---------------------------------------------------------------- 类型
 
-type CardKind = "receive" | "send" | "reply" | "failed";
+type CardKind = "receive" | "send" | "reply" | "failed" | "watch";
 
 /** 主题颜色名。写成字面量联合而不是 string —— 否则 theme.fg 类型不过 */
 type CardColor = "accent" | "success" | "error";
@@ -206,6 +207,29 @@ async function runIntentions(
           ctx.ui.notify(msg, "error");
           // 发信人必须知道请求没进去,否则它会一直等回信
           void notifyInjectFailure(String(it.from ?? ""), reason, ctx);
+        }
+        break;
+      }
+
+      case "watch": {
+        const action = String(it.action);
+        const target = it.target ? String(it.target) : undefined;
+        if (!transport?.sendWatch?.(action, target)) {
+          const msg = "team:未连接,订阅没登记上";
+          notes.push(msg);
+          ctx.ui.notify(msg, "error");
+        }
+        break;
+      }
+
+      case "publish": {
+        // 把这一轮的输出发给所有订阅我的人。没人订阅时 broker 会回
+        // watch_none,由 session.js 转成一条 notify —— 不静默。
+        const text = String(it.text ?? "");
+        if (!text.trim()) break;
+        if (!transport?.publishToWatchers?.(text)) {
+          // 发不出去不算错:没人在看是常态,连接断了也不该打断这一轮。
+          break;
         }
         break;
       }
@@ -526,6 +550,7 @@ export default function (pi: ExtensionAPI) {
       send: { icon: "📤", label: "SEND", color: "success", arrow: "→" },
       reply: { icon: "🔁", label: "REPLY", color: "success", arrow: "→" },
       failed: { icon: "⚠️", label: "FAIL", color: "error", arrow: "→" },
+      watch: { icon: "👀", label: "SUB", color: "accent", arrow: "←" },
     };
     const m = meta[kind] ?? meta.receive;
 
@@ -732,6 +757,9 @@ export default function (pi: ExtensionAPI) {
       "",
       "**发送**:调用 `team_send({ to, text })`。`to` 可以是节点名、`@label`(分组)、`\"*\"`(全员)、`\"@default\"`(默认组),或数组。",
       "**查成员**:调用 `team_roster()`,或 `team_info({ what: \"peers\" })`。",
+      describeWatches(state.watch)
+        ? `**订阅**:你正在订阅 ${describeWatches(state.watch)} 的回答(只收到卡片,不会叫醒你;不要当成待回复的请求)。`
+        : "",
       "",
       "**接收**:输入里出现 `[来自 <名字> 的 team 消息]` 前缀时,那是另一个 agent 发来的请求,不是真人打字。",
       "按内容本身的意思回应:是任务就执行,是讨论就接着走。不要反问「需要我做什么」。",
@@ -1037,12 +1065,59 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "team_watch",
+    label: "Team Watch",
+    description:
+      "订阅某个 teammate 的回答:对方每轮结束时的最终输出会以卡片送到你这里(不会叫醒你的模型,也不会触发新一轮)。add / remove / list。只在 broker 模式可用,上限 8 个。对方不会知道你在订阅。",
+    promptSnippet: "team_watch(action, target?) — 订阅某个 teammate 的回答(只通知,不唤醒你)",
+    promptGuidelines: [
+      "Subscribe when you need to keep seeing what a specific peer concludes, without the peer doing anything differently.",
+      "Watch notifications are cards, not messages — they never start a turn. Read them when you next run; do not treat them as an unanswered request.",
+      "Only broker mode supports watch; it fails loudly under mesh/swim.",
+    ],
+    parameters: Type.Object({
+      action: Type.String({ description: "'add'、'remove' 或 'list'" }),
+      target: Type.Optional(Type.String({ description: "节点名(add/remove 必需,单个名字)" })),
+    }),
+
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("team_watch ")) +
+          theme.fg("accent", String(args?.action ?? "list")) +
+          (args?.target ? theme.fg("muted", ` ${args.target}`) : ""),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _options, theme) {
+      const d = result.details as { ok?: boolean; lines?: string[] } | undefined;
+      return new Text(theme.fg(d?.ok ? "success" : "error", (d?.lines ?? []).join("\n")), 0, 0);
+    },
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const r = await invoke(
+        {
+          sub: "watch",
+          args: [String(params.action ?? "list"), String(params.target ?? "")],
+          origin: "model",
+        },
+        ctx,
+      );
+      return {
+        content: [{ type: "text", text: r.ok ? r.lines.join("\n") : `失败:${r.error}` }],
+        details: { ok: r.ok, lines: r.ok ? r.lines : [r.error] },
+      };
+    },
+  });
+
   // ---- 命令入口(给人用)
   pi.registerCommand("team", {
     description: "Pi Agent Team:状态 / 成员 / 发送 / team 生命周期 / 标签",
     getArgumentCompletions(prefix) {
       const subs = [
-        "status", "peers", "create", "join", "leave", "mode", "label", "send", "reply", "on", "off",
+        "status", "peers", "create", "join", "leave", "mode", "label", "send", "reply", "watch", "on", "off",
       ];
       if (!prefix.includes(" ")) {
         return subs.filter((s) => s.startsWith(prefix)).map((s) => ({ value: s, label: s, description: `/team ${s}` }));
@@ -1053,6 +1128,22 @@ export default function (pi: ExtensionAPI) {
 
       if (sub === "label") {
         return ["list", "add", "remove"].filter((o) => o.startsWith(partial)).map((o) => ({ value: o, label: o }));
+      }
+
+      if (sub === "watch") {
+        if (rest.length <= 1) {
+          return ["list", "add", "remove"]
+            .filter((o) => o.startsWith(partial))
+            .map((o) => ({ value: o, label: o, description: `/team watch ${o}` }));
+        }
+        // 目标补全:只能订阅节点名(单个),所以从在线成员里出
+        return others(state)
+          .filter((m) => m.name.startsWith(partial))
+          .map((m) => ({
+            value: m.name,
+            label: m.name,
+            description: m.host ? `${m.host}${m.labels?.length ? ` · ${m.labels.join(" ")}` : ""}` : undefined,
+          }));
       }
 
       if (sub === "send" && rest.length <= 1) {

@@ -24,6 +24,7 @@ import {
 import { createTeam, joinTeam, leaveTeam, listTeams, readTeam } from "./team-config.js";
 import { OPTION_HELP, checkModeRequirements, parseOptionArgs, validateOptions } from "./options.js";
 import { MODES } from "./mode.js";
+import { MAX_WATCHES, validateWatchTarget } from "./watch.js";
 
 /** 群发前确认阈值。每个收件人都会跑一轮完整思考,不该手滑就发生。 */
 export const BULK_WARN_THRESHOLD = 5;
@@ -81,6 +82,65 @@ const newId = () => `m-${Date.now().toString(36)}-${PROC_TAG}-${(idSeq++).toStri
  * @param {{ connState: string, team: string|null, config: {url,token,labels?}|null, host?: string }} env
  * @returns {Result}
  */
+function watchResult(args, state, env) {
+  // 订阅靠 broker 转发通知,mesh/swim 里没有 broker 可以登记。
+  // 要说得髺,不能静默 no-op —— 用户会以为在看,实际什么都没发生。
+  const mode = env?.mode ?? env?.config?.mode ?? "broker";
+  if (mode !== "broker") {
+    return bad(`订阅只在 broker 模式下可用(当前 ${mode})。mesh/swim 里通知没有地方转发。`);
+  }
+
+  const action = (args[0] ?? "").trim();
+  const target = (args[1] ?? "").trim();
+
+  if (!action || action === "list") {
+    const list = [...state.watch.targets].sort();
+    return ok(
+      list.length
+        ? [
+            `正在订阅:${list.join(", ")}`,
+            "",
+            "收到的是对方的最终回答(只出卡片,不会叫醒你)。",
+            "对方不知道你在看。broker 重启后会自动重新登记。",
+          ]
+        : [
+            "没有订阅任何人",
+            "",
+            "用法:/team watch add <节点名>",
+            `上限 ${MAX_WATCHES} 个。只在 broker 模式可用。`,
+          ],
+    );
+  }
+
+  if (action === "add") {
+    const err = validateWatchTarget(target, state.self);
+    if (err) return bad(err);
+    if (state.watch.targets.has(target)) return ok([`已经订阅了 ${target}`]);
+    if (state.watch.targets.size >= MAX_WATCHES) {
+      return bad(`最多订阅 ${MAX_WATCHES} 个,先 /team watch remove 掉一个`);
+    }
+    // 不在这里改本地集合:broker 才是权威。watch_ack 回来才真的算订阅上。
+    return ok([`正在订阅 ${target}…`], {
+      intentions: [{ type: "watch", action: "add", target }],
+    });
+  }
+
+  if (action === "remove" || action === "off") {
+    if (!target) return bad("要取消订阅谁?/team watch remove <节点名>");
+    if (!state.watch.targets.has(target)) {
+      // 本地不知道但 broker 可能有(比如另一个会话登记的),照样发出去
+      return ok([`本来就没有订阅 ${target}`], {
+        intentions: [{ type: "watch", action: "remove", target }],
+      });
+    }
+    return ok([`已取消订阅 ${target}`], {
+      intentions: [{ type: "watch", action: "remove", target }],
+    });
+  }
+
+  return bad(`未知的订阅动作 "${action}"。用 add / remove / list。`);
+}
+
 export function dispatch(input, state, env) {
   const { sub, args } = input;
 
@@ -115,6 +175,9 @@ export function dispatch(input, state, env) {
     case "reply":
     case "announce":
       return replyResult(args, state, sub);
+
+    case "watch":
+      return watchResult(args, state, env);
 
     case "on":
       state.reply = "remind";

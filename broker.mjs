@@ -87,6 +87,37 @@ if (args.bind === "0.0.0.0" || args.bind === "::") {
  */
 const peers = new Map();
 
+/**
+ * 订阅表:订阅者名 → 它订阅的目标节点名集合。
+ *
+ * 这是 broker 里第一张"不是谁在线"的表。它仍然不存任何消息内容,也不落盘:
+ * broker 重启就没了,由订阅者在 welcome 后重新登记(见 websocket 消息的
+ * listen action)。不变量是 watches ⊆ peers.keys():socket 关闭时删掉,
+ * 和 peers 用同一个身份判断保护。
+ *
+ * 方向是单向的:被订阅者永远不知道自己在被看。发布通知时不发回执,
+ * 否则回执本身就是泄露。
+ */
+const watches = new Map();
+
+/** 一个节点最多订阅多少个目标,和其他限额同一个量级 */
+const MAX_WATCHES_PER_NODE = 8;
+
+/**
+ * 虚拟收件人名字。被订阅者把每轮输出发到这里,broker 展开成订阅者名单。
+ * 下划线打头,和普通节点名(NAME_RE 不允许下划线开头)不会撞。
+ */
+const WATCH_RECIPIENT = "_watchers";
+
+/** 单条订阅通知的摘要上限(字符数,按码点算)。 */
+const WATCH_SUMMARY_LIMIT = 200;
+
+/** 同一对 (发布者, 订阅者) 每秒最多发几条通知。超出的合并计数,不丢弃。 */
+const WATCH_RATE = 3;
+
+/** 限流用的令牌桶,键是 "发布者|订阅者" */
+const watchRate = new Map();
+
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const fingerprint = createHash("sha256").update(TOKEN).digest("hex").slice(0, 8);
 
@@ -272,6 +303,11 @@ function handshake(req, socket, allowTakeover) {
     // 反过来的话,旧 socket 的 close 处理器会看到 peers.get(name)
     // 仍是自己,于是广播一条假的 peer_left。
     peers.delete(name);
+    // 同一个理由,订阅表也必须在这里清,而不是靠旧 socket 的 close:
+    // close 里那句身份判断(防止假 peer_left 的那个)同时也会让旧连接的
+    // close 直接 return,于是旧订阅永远没人清,新连接会莫名其妙继承它们。
+    // 新连接从空订阅开始 —— 订阅是会话级的,换连接就是换会话。
+    for (const target of dropWatches(name)) tellWatcherCount(target);
     try {
       existing.socket.write(closeFrame(CLOSE_REPLACED));
       existing.socket.end();
@@ -298,6 +334,220 @@ function handshake(req, socket, allowTakeover) {
     tags: parseTags(url.searchParams.get("tags")),
     host: host && host.length <= 64 ? host : null,
   };
+}
+
+// ------------------------------------------------------------------ 订阅
+
+/** 目标的订阅者名单 */
+function watchersOf(name) {
+  const out = [];
+  for (const [subscriber, targets] of watches) {
+    if (subscriber !== name && targets.has(name)) out.push(subscriber);
+  }
+  return out;
+}
+
+/**
+ * 通知一个节点:现在有几个订阅者。
+ *
+ * 只给数量,永远不给名字 —— 订阅是单向的,被订阅者不该能知道是谁在看。
+ * 这个计数唯一的用途是"有没有人看",发布方据此决定要不要费劲把每轮
+ * 输出发过 来。
+ */
+function tellWatcherCount(name) {
+  const peer = peers.get(name);
+  if (!peer) return;
+  write(peer.socket, sys({ kind: "watch_state", watchers: watchersOf(name).length }, name));
+}
+
+/**
+ * 把一个节点作为**订阅者**和作为**目标**的记录都清掉。
+ *
+ * 两条路径都要调它:连接关闭,以及同名接管。接管那条尤其重要 ——
+ * 旧 socket 的 close 会因为身份判断而直接 return,所以那是唯一清掉旧订阅的时机。
+ *
+ * 返回"订阅数因此变少了的目标" —— 调用方要通知它们,否则它们会继续
+ * 以为有人在看。
+ */
+function dropWatches(name) {
+  const affected = new Set();
+
+  // 这个名字自己订阅别人:它作为订阅者消失,那些目标各少一个观察者。
+  const own = watches.get(name);
+  if (own) {
+    for (const target of own) affected.add(target);
+    watches.delete(name);
+  }
+
+  // 别人订阅这个名字:它作为目标消失。
+  for (const [subscriber, targets] of watches) {
+    if (targets.delete(name) && targets.size === 0) {
+      // 目标离线了。空集合没意义,但也不通知订阅者 ——
+      // 目标上下线本来就由 peer_left/peer_joined 广播。
+      watches.delete(subscriber);
+    }
+  }
+
+  return [...affected];
+}
+
+/**
+ * 发布一次订阅通知。
+ *
+ * 这是 broker 唯一自己产生、且携带用户内容的帧(其余都是 sys() 控制帧)。
+ * 由被订阅者在每轮结束时主动发到虚拟收件人 `_watchers`,不要和普通
+ * 投递混在一起 —— 复用到货回执就等于告诉发布者它在被看。
+ *
+ * summary 在这里截断,而不是让发送方截:发出去的帧大小必须由 broker 控制。
+ *
+ * 限流逐订阅者独立判断:被限掉的那一对不收到帧,它的计数转成下一条上的
+ * overflow —— 合并而不是丢弃,因为静默丢掉既满足限速又在对用户说谎。
+ */
+function handleWatchPublish(name, env, socket) {
+  if (typeof env.body?.text !== "string" || !env.body.text.trim()) {
+    write(socket, sys({ kind: "watch_error", reason: "empty" }, name, env.id));
+    return;
+  }
+
+  const subscribers = watchersOf(name);
+  if (subscribers.length === 0) {
+    // 没人在听不是错误,但也不静默:发送方(通常是模型)需要知道自己
+    // 以为有人会收到,实际没有。
+    write(socket, sys({ kind: "watch_none", to: WATCH_RECIPIENT }, name, env.id));
+    return;
+  }
+
+  const text = env.body.text;
+  // 按码点截断,不要把代理对切成两半。
+  const chars = [...text];
+  const overLimit = chars.length > WATCH_SUMMARY_LIMIT;
+  const summary = overLimit ? `${chars.slice(0, WATCH_SUMMARY_LIMIT).join("")}…` : text;
+
+  const now = Date.now();
+  let sent = 0;
+  for (const subscriber of subscribers) {
+    if (!allowWatch(name, subscriber)) continue;
+    const peer = peers.get(subscriber);
+    if (!peer) continue;
+    // takeOverflow 有副作用(清零计数),只能取一次。
+    const overflow = takeOverflow(name, subscriber);
+    write(
+      peer.socket,
+      sys(
+        {
+          kind: "watch_notify",
+          target: name,
+          at: now,
+          summary,
+          ...(overLimit ? { fullLength: chars.length } : {}),
+          ...(overflow !== undefined ? { overflow } : {}),
+        },
+        subscriber,
+      ),
+    );
+    sent += 1;
+  }
+  if (sent > 0) log(`${name} → ${WATCH_RECIPIENT}:通知 ${sent}/${subscribers.length} 个订阅者`);
+}
+
+/**
+ * 取走并清零这一对的溢出计数。
+ *
+ * 限流时合并而不是丢弃:静默丢掉既满足限速又在对用户说谎。
+ */
+function takeOverflow(name, subscriber) {
+  const key = `${name}|${subscriber}`;
+  const bucket = watchRate.get(key);
+  if (!bucket || bucket.overflow === 0) return undefined;
+  const n = bucket.overflow;
+  bucket.overflow = 0;
+  return n;
+}
+
+/**
+ * 令牌桶:同一对 (发布者, 订阅者) 每秒最多 WATCH_RATE 条通知。
+ * 超出的不是丢弃,而是在下一条上带着 overflow 计数发出去。
+ */
+function allowWatch(name, subscriber) {
+  const key = `${name}|${subscriber}`;
+  const now = Date.now();
+  let bucket = watchRate.get(key);
+  if (!bucket) {
+    bucket = { tokens: WATCH_RATE, last: now, overflow: 0 };
+    watchRate.set(key, bucket);
+  }
+  const elapsed = now - bucket.last;
+  if (elapsed > 0) {
+    bucket.tokens = Math.min(WATCH_RATE, bucket.tokens + (elapsed / 1000) * WATCH_RATE);
+    bucket.last = now;
+  }
+  if (bucket.tokens >= 1) {
+    bucket.tokens -= 1;
+    return true;
+  }
+  bucket.overflow += 1;
+  return false;
+}
+
+/** 处理 `_watchers` 收件人的投递 */
+function handleWatchPublishEntry(name, env, socket) {
+  handleWatchPublish(name, env, socket);
+}
+
+/** 处理订阅登记帧:body.kind === "watch" */
+function handleWatchControl(name, env, socket) {
+  const action = env.body?.action;
+  const target = typeof env.body?.target === "string" ? env.body.target.trim() : "";
+  let set = watches.get(name);
+  if (!set) {
+    set = new Set();
+    watches.set(name, set);
+  }
+
+  if (action === "list") {
+    write(socket, sys({ kind: "watch_ack", action: "list", watches: [...set] }, name, env.id));
+    return;
+  }
+
+  if (action === "add") {
+    if (!NAME_RE.test(target)) {
+      write(socket, sys({ kind: "watch_error", action, reason: "bad_target", target }, name, env.id));
+      return;
+    }
+    if (target === name) {
+      write(socket, sys({ kind: "watch_error", action, reason: "self", target }, name, env.id));
+      return;
+    }
+    if (set.size >= MAX_WATCHES_PER_NODE && !set.has(target)) {
+      // 一次拒一个,让订阅者自己选留哪个。绝不静默 LRU 淘汰:
+      // 被淘汰的订阅是无声的功能丢失。
+      write(
+        socket,
+        sys({ kind: "watch_error", action, reason: "limit", limit: MAX_WATCHES_PER_NODE, target }, name, env.id),
+      );
+      return;
+    }
+    set.add(target);
+    write(socket, sys({ kind: "watch_ack", action: "add", target, state: "registered" }, name, env.id));
+    // 目标可能正好在线,告诉它现在有人在看了 —— 否则它要等到下一次
+    // 重连才能知道,期间每一轮输出都会因为计数为 0 而发不出去。
+    tellWatcherCount(target);
+    log(`${name} 订阅了 ${target}`);
+    return;
+  }
+
+  if (action === "remove") {
+    const had = set.delete(target);
+    if (set.size === 0) watches.delete(name);
+    write(
+      socket,
+      sys({ kind: "watch_ack", action: "remove", target, state: had ? "removed" : "absent" }, name, env.id),
+    );
+    if (had) tellWatcherCount(target);
+    return;
+  }
+
+  write(socket, sys({ kind: "watch_error", reason: "bad_action", action }, name, env.id));
 }
 
 // ------------------------------------------------------------------ 消息
@@ -328,6 +578,19 @@ function handleMessage(name, socket, text) {
   if (env.from !== name) {
     log(`注意:${name} 自报 from=${env.from},已覆盖为连接身份`);
     env.from = name;
+  }
+
+  // 订阅控制帧。在收件人解析之前拦下来 —— 它的 to 是 "broker",
+  // 走普通投递会被当成一个不存在的节点。
+  if (env.body && typeof env.body === "object" && env.body.kind === "watch") {
+    handleWatchControl(name, env, socket);
+    return;
+  }
+
+  // 虚拟收件人:把这一轮输出发给所有订阅者。
+  if (env.to === WATCH_RECIPIENT) {
+    handleWatchPublish(name, env, socket);
+    return;
   }
 
   const toDesc = Array.isArray(env.to) ? env.to.join(",") : String(env.to);
@@ -488,6 +751,14 @@ server.on("upgrade", (req, socket) => {
     // 这正是防止假 peer_left 抖动的那个判断。
     if (peers.get(name)?.socket !== socket) return;
     peers.delete(name);
+    // 订阅表跟着连接走。有了这一行,"watches ⊆ peers" 就是构造上成立的,
+    // 不需要扫描线程。(接管那条路径见 handshake 里的 dropWatches ——
+    // 那个分支不会走到这里。)
+    const affected = dropWatches(name);
+    // 通知自己:作为目标,原来看它的人可能少了。
+    tellWatcherCount(name);
+    // 通知它看过的那些目标:它们各少了一个观察者。
+    for (const target of affected) tellWatcherCount(target);
     log(`离开:${name}(在线 ${peers.size})`);
     broadcast(sys({ kind: "peer_left", peer: name, peers: nameList(), members: members() }));
   });
@@ -504,7 +775,17 @@ server.on("upgrade", (req, socket) => {
   });
   log(`加入:${name}(在线 ${peers.size})${tags.length ? ` tags=${tags.join(",")}` : ""}${host ? ` host=${host}` : ""}`);
 
-  write(socket, sys({ kind: "welcome", peer: name, peers: nameList().filter((n) => n !== name), members: members() }));
+  // watchers:启动时就告知有几个人在订阅这个节点,不用等一次订阅变动。
+  write(
+    socket,
+    sys({
+      kind: "welcome",
+      peer: name,
+      peers: nameList().filter((n) => n !== name),
+      members: members(),
+      watchers: watchersOf(name).length,
+    }),
+  );
   broadcast(sys({ kind: "peer_joined", peer: name, peers: nameList(), members: members() }), name);
 });
 

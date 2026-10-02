@@ -21,6 +21,8 @@
  * 这样每个场景都能用几行测试覆盖,不需要起 Pi、不需要起 broker。
  */
 
+import { createWatchState, applyWatchAck, formatWatchNotify, validateWatchTarget, describeWatches, MAX_WATCHES } from "./watch.js";
+
 /** 跳数上限:最后一道防线,正常对话形状不应碰到它 */
 const MAX_HOPS = 4;
 
@@ -53,8 +55,9 @@ const MAX_PENDING_REPLIES = 32;
  *             ref: string, seen: boolean, reminded: boolean }} PendingReply
  *
  * @typedef {{ type: "inject", payload: string, from: string }
- *   | { type: "card", kind: "receive"|"send"|"reply"|"failed"|"fyi", peer: string, text: string, reason?: string }
+ *   | { type: "card", kind: "receive"|"send"|"reply"|"failed"|"fyi"|"watch", peer: string, text: string, reason?: string }
  *   | { type: "send", to: string|string[], text: string, hops: number, re: string|null, origin: "user"|"model" }
+ *   | { type: "watch", action: "add"|"remove", target: string }
  *   | { type: "notify", level: "info"|"warning"|"error", message: string }
  *   | { type: "status" }} Action
  */
@@ -99,6 +102,17 @@ export function createSessionState(self = "") {
     pendingReplies: [],
     /** 上一轮的输出文本,供 reply=mirror 镜像用 */
     lastText: "",
+    /** 我订阅了谁的回答。见 watch.js 顶部的循环保护说明。 */
+    watch: createWatchState(),
+    /**
+     * 有几个人在订阅我。由 broker 告知(welcome 里的 watchers 字段,
+     * 以及订阅变化时的 watch_state 帧)。
+     *
+     * 只用来决定要不要把本轮输出发出去:0 就不发。这是一个粗略的布尔泄露
+     * (能知道"有人在看我",但不知道是谁、也不知道具体几个之外的信息),
+     * 换来的是未使用这个特性的部署不因为升级而多出一条每轮上报。
+     */
+    watcherCount: 0,
   };
 }
 
@@ -363,7 +377,43 @@ export function handleIncoming(s, env, now = Date.now()) {
             message: `team:${body.peer} 上线${m?.host ? ` (${m.host})` : ""}`,
           });
         }
+        // 订阅不落盘,broker 重启就没了。welcome 是"世界重来一遍"的信号,
+        // 所以在这里重新登记一次。丢的是断线期间的通知 —— 和消息一样,
+        // 不用为它发明补发协议。
+        if (kind === "welcome") {
+          // 顺带告知有几个人在订阅我,发布时用它做门控。
+          if (typeof body.watchers === "number") s.watcherCount = body.watchers;
+          if (s.watch.targets.size > 0) {
+            for (const target of s.watch.targets) {
+              actions.push({ type: "watch", action: "add", target });
+            }
+          }
+        }
         return actions;
+      }
+
+      case "watch_state": {
+        // 有人在看我/没人看我了。只改计数,不通知用户 —— 订阅是单向的,
+        // 给用户刷"某人开始看你"就把单向性做成了双向。
+        if (typeof body.watchers === "number") s.watcherCount = body.watchers;
+        return [];
+      }
+
+      case "watch_ack":
+      case "watch_error":
+      case "watch_none": {
+        const r = applyWatchAck(s.watch, body);
+        if (!r) return [];
+        return [{ type: "notify", level: r.level, message: `team:${r.lines.join("\n")}` }];
+      }
+
+      case "watch_notify": {
+        // ── 整个循环保护的落点 ──
+        // 只出一张卡片,没有 inject。所以互相订阅不会 ping-pong:
+        // 收到的人模型不跑,也就没有下一轮输出。
+        const f = formatWatchNotify(env);
+        if (!f) return [];
+        return [{ type: "card", kind: "watch", peer: f.peer, text: f.text }];
       }
 
       case "undeliverable":
@@ -479,10 +529,27 @@ export const TEAM_MESSAGE_TYPE = "team-msg";
  * compaction、queued continuation,拿它当"结束"会推中间态。
  */
 export function onTurnSettled(s) {
+  // ── 订阅发布 ──
+  //
+  // 先做这一步,而且和 reply 模式无关。订阅是"别人想看我",
+  // reply 是"我想怎么回别人",两件事。以前只有 mirror 会主动往外发,
+  // 所以订阅在 off/remind 下根本收不到东西。
+  //
+  // 只能在这里做:agent_settled 的事件对象没有 messages,
+  // 本轮输出只能在 message_end 里攒(见 observeMessage)。
+  //
+  // 门控用 s.watcherCount(broker 告诉我有几个人在看我),不是我自己的
+  // 订阅列表 —— 那是"我想看谁",和这条完全无关。
+  // 用计数而不是无条件发:没订阅的部署不该因为升级就开始把每轮输出
+  // 送给 broker。
+  const published = s.watcherCount > 0 && s.lastText.trim()
+    ? { type: "publish", text: s.lastText }
+    : null;
+
   if (s.reply === "off") {
     s.pendingReplies = [];
     s.lastText = "";
-    return [];
+    return published ? [published] : [];
   }
 
   if (s.reply === "mirror") {
@@ -490,10 +557,10 @@ export function onTurnSettled(s) {
     if (!text.trim()) return [];
     s.lastText = "";
     const list = others(s);
-    if (list.length === 0) return [];
+    if (list.length === 0) return published ? [published] : [];
     // fyi:true 让收件人只显示卡片,不叫醒它的模型。否则 N 个节点都开
     // always 时,每轮都会触发 N-1 轮新思考。
-    return list.map((m) => ({
+    const mirror = list.map((m) => ({
       type: "send",
       to: m.name,
       text,
@@ -505,12 +572,15 @@ export function onTurnSettled(s) {
       targets: [m.name],
       card: { kind: "send", peer: m.name, text },
     }));
+    // 订阅发布和 mirror 是两件事,可能同时发生:mirror 发给所有人,
+    // 订阅只发给登记过的人。
+    return published ? [published, ...mirror] : mirror;
   }
 
   // auto:不再自动把某段文本当成回复发出去 —— 实测模型会在同一个 run 里
   // 先回应队友再做完原任务,按段落猜归属会把原任务的收尾(i.e. "DONE")
   // 发给队友。改为:只在请求还没被回复时提醒模型一次。
-  const actions = [];
+  const actions = published ? [published] : [];
   const online = new Set(others(s).map((m) => m.name));
   const stillPending = [];
 
