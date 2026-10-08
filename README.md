@@ -34,6 +34,65 @@ No public relay, no phone app, no account.
 - **An agent skill ships with it**, so the model knows the commands without
   being told.
 
+## pi-agent-team or A2A?
+
+[`@bacnh85/pi-a2a`](https://pi.dev/packages/@bacnh85/pi-a2a) also connects Pi
+to other agents, over the [A2A protocol](https://a2a-protocol.org/). Neither
+package replaces the other. The difference that decides it is where an incoming
+message runs.
+
+pi-agent-team delivers a teammate's message into the Pi session that is already
+running. The model that reads it has that session's context: the task in
+progress, what it already tried, what it has changed. It answers with
+`team_send` when it chooses to.
+
+pi-a2a starts a new, isolated Pi session for each incoming task, runs it to
+completion and returns the reply as a task artifact. That session works in the
+same repository but starts with an empty context. Anything the job needs has to
+be in the message or found again on disk.
+
+So pi-agent-team is for agents that keep working and talk along the way. A2A is
+for handing a self-contained job to an agent and getting a result back.
+
+| | pi-agent-team | pi-a2a |
+|---|---|---|
+| Who handles an incoming message | the running session, at its next turn | a new isolated session per task |
+| Who it can talk to | Pi nodes running this extension | any A2A agent: Pi, Hermes, Google ADK, LangChain, CrewAI |
+| Addressing | name, list, `@label`, `*` | peer name or URL; `a2a_orchestrate` fans out by advertised capability |
+| Finding peers on other machines | broker roster, mesh seeds or SWIM gossip, over the tailnet | static `peers` config, mDNS on one LAN, or a self-hosted a2a-switchboard gateway |
+| Stopping two agents looping | `re` marks a reply, and a reply is never answered | a turn cap per conversation (default 5) |
+| Long jobs | the sender does not block; the answer arrives later as a `team_send` | `returnImmediately` acks at once, `a2a_status` polls by task id |
+| Following a peer | `/team watch` shows its turn output without waking you | none |
+| Auth | one shared team token | shared or per-peer tokens, plus audit log, rate limits, inbound injection filtering and outbound redaction |
+
+Compared against pi-a2a 0.7.13.
+
+### Use pi-agent-team when
+
+- every agent is Pi, on machines you control, connected by a private network.
+- the message must reach the session doing the work. "How far along is the
+  migration?" only makes sense to the session running it.
+- you split work by role and address it by label, such as `@review` or
+  `@runner`.
+- you want to follow another agent's conclusions with `/team watch` without
+  starting a turn of your own.
+
+### Use pi-a2a when
+
+- the other agent is not Pi, or not yours: Hermes, Google ADK, LangChain,
+  CrewAI, anything that speaks A2A.
+- the job is self-contained and you want a result, not a conversation.
+- the job runs longer than you want to wait, and you would rather poll it by
+  task id.
+- callers need separate identities, an audit trail or rate limits.
+
+### Both at once
+
+The tool names do not overlap (`team_*` and `a2a_*`), and pi-a2a's inbound
+server stays off until you start it. One workable split is pi-agent-team
+between your own Pi nodes, and pi-a2a's outbound `a2a_call` for agents outside
+the team.
+
 ## Install
 
 ```bash
