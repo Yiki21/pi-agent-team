@@ -10,6 +10,8 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import registerExtension from "../index.ts";
 
 function fakeUi() {
@@ -28,6 +30,7 @@ function load() {
   const flags = new Map();
   const tools = [];
   const commands = [];
+  const entries = [];
 
   registerExtension({
     on(event, handler) {
@@ -49,11 +52,13 @@ function load() {
       return undefined;
     },
     registerEntryRenderer() {},
-    appendEntry() {},
+    appendEntry(customType, data) {
+      entries.push({ type: "custom", customType, data });
+    },
     sendMessage() {},
   });
 
-  return { handlers, flags, tools, commands };
+  return { handlers, flags, tools, commands, entries };
 }
 
 /** 依次触发某个事件的所有 handler,返回它们的结果 */
@@ -149,3 +154,107 @@ test("注册了 /team 命令", () => {
     true,
   );
 });
+
+// ---------------------------------------------------------------- resume 重连
+
+/**
+ * 在临时 HOME 里放一份 team 配置,清掉 TEAM* 环境变量,跑完还原。
+ * url 指向一个不监听的端口:只验证"决定连哪个 team",不需要真的连上。
+ */
+async function withTeamHome(fn) {
+  const saved = { HOME: process.env.HOME };
+  for (const k of Object.keys(process.env)) if (k.startsWith("TEAM")) saved[k] = process.env[k];
+  for (const k of Object.keys(saved)) if (k !== "HOME") delete process.env[k];
+
+  mkdirSync(".tmp", { recursive: true });
+  const home = mkdtempSync(join(".tmp", "home-"));
+  const dir = join(home, ".pi", "agent", "pi-agent-team");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "alpha.json"),
+    JSON.stringify({ team: "alpha", url: "ws://127.0.0.1:9/ws", token: "SECRET", mode: "broker" }),
+  );
+  process.env.HOME = join(process.cwd(), home);
+
+  try {
+    await fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+/** 带 sessionManager 和通知记录的 ctx */
+function sessionCtx(branch = []) {
+  const notes = [];
+  return {
+    notes,
+    ui: { ...fakeUi(), notify: (text, level) => notes.push({ text, level }) },
+    sessionManager: { getBranch: () => branch },
+  };
+}
+
+const binding = (data) => ({ type: "custom", customType: "team-binding", data });
+
+test("resume 按会话里记下的 team 和名字重连", () =>
+  withTeamHome(async () => {
+    const fake = load();
+    const ctx = sessionCtx([binding({ team: "alpha", name: "node-a", labels: ["gpu"] })]);
+
+    await emit(fake, "session_start", { reason: "resume" }, ctx);
+    try {
+      assert.ok(
+        ctx.notes.some((n) => n.text.includes(`重新加入 "alpha"`) && n.text.includes("node-a")),
+        `应提示已重连,实际:${JSON.stringify(ctx.notes)}`,
+      );
+      assert.equal(fake.entries.length, 0, "绑定没变,不该重复写进会话");
+    } finally {
+      await emit(fake, "session_shutdown", {}, ctx);
+    }
+  }));
+
+test("fork 不按记下的 team 重连", () =>
+  withTeamHome(async () => {
+    const fake = load();
+    const ctx = sessionCtx([binding({ team: "alpha", name: "node-a", labels: [] })]);
+
+    await emit(fake, "session_start", { reason: "fork" }, ctx);
+    await emit(fake, "session_shutdown", {}, ctx);
+
+    assert.equal(ctx.notes.some((n) => n.text.includes("重新加入")), false);
+  }));
+
+test("/team join 记下绑定(不含 token),/team leave 之后 resume 不再重连", () =>
+  withTeamHome(async () => {
+    const fake = load();
+    const ctx = sessionCtx();
+    const team = fake.commands.find((c) => c.name === "team").options;
+
+    await emit(fake, "session_start", { reason: "new" }, ctx);
+    try {
+      await team.handler("join alpha", ctx);
+
+      const joined = fake.entries.filter((e) => e.customType === "team-binding");
+      assert.equal(joined.length, 1, `join 后应记一条绑定:${JSON.stringify(ctx.notes)}`);
+      assert.equal(joined[0].data.team, "alpha");
+      assert.equal(JSON.stringify(joined[0].data).includes("SECRET"), false, "token 不能进会话文件");
+
+      await team.handler("leave alpha", ctx);
+      const last = fake.entries.at(-1);
+      assert.equal(last.customType, "team-binding");
+      assert.equal(last.data.team, null);
+    } finally {
+      // 断言失败也要停掉 transport,否则重连定时器让测试进程挂住
+      await emit(fake, "session_shutdown", {}, ctx);
+    }
+
+    // 离开之后再 resume:最后一条绑定是 null,不该连回去
+    const again = load();
+    const ctx2 = sessionCtx(fake.entries);
+    await emit(again, "session_start", { reason: "resume" }, ctx2);
+    await emit(again, "session_shutdown", {}, ctx2);
+    assert.equal(ctx2.notes.some((n) => n.text.includes("重新加入")), false);
+  }));

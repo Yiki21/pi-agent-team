@@ -254,6 +254,27 @@ already in use. Pass them on each run.
 
 `/team mode` switches mode without retyping `url` or `token`.
 
+### Resuming a session
+
+`pi --resume` reconnects to the same team with the same name and labels, and
+says so in a notice.
+
+What is remembered lives in the session, not in the shared config file, so it
+stays per-session: join a different team in one Pi and the others are
+unaffected. Nothing secret goes in the session — the token is read from the
+team config file as usual.
+
+Three things it deliberately does not do:
+
+- **`--fork` does not reconnect.** Two branches under one name would keep
+  replacing each other. A fork starts unbound.
+- **Flags and environment variables still win.** `--team-name` or `TEAM_NAME`
+  overrides the remembered name.
+- **`/team leave` is remembered too.** Resume after leaving does not join again.
+
+Changes made with `/team join --name` or `/team label` are recorded when the
+connection is live, so resume picks up the latest values.
+
 ## Watching a peer's answers
 
 `reply` is about how *you* answer others. Subscribing is the inverse: it is how you

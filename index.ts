@@ -48,6 +48,14 @@ type CardDetails = { kind: CardKind; peer: string; text: string; at: number; rea
 
 const CARD_TYPE = "team-message";
 
+/**
+ * 这个会话加入了哪个 team、用什么名字和标签。resume 时据此自动重连。
+ * 不含 token:凭据只在 0600 的 team 配置文件里,session 文件里不出现。
+ */
+type Binding = { team: string | null; name: string; labels: string[] };
+
+const BINDING_TYPE = "team-binding";
+
 type ConnState = "offline" | "connecting" | "online" | "replaced" | "auth_failed";
 
 // ---------------------------------------------------------------- 运行时
@@ -67,6 +75,9 @@ let currentConfig: { url: string; token: string; labels?: string[] } | null = nu
 
 let ctxRef: ExtensionContext | null = null;
 let apiRef: ExtensionAPI | null = null;
+
+/** 最近写进 session 的 Binding,序列化后比较,没变就不重复写 */
+let lastBinding = "";
 
 /**
  * 队友消息以"自定义消息"送达(pi.sendMessage),不是用户消息。
@@ -281,6 +292,9 @@ async function runParty(party: Record<string, unknown> | undefined, ctx: Extensi
 
     case "disconnect":
       teardownConnection();
+      // 只在用户主动断开时记。session_shutdown 也走 teardownConnection,
+      // 但关会话不等于离开 team,记了 resume 就连不回去了。
+      recordBinding(null);
       return true;
 
     case "reconnect": {
@@ -346,6 +360,24 @@ async function invoke(
 
 function showCard(details: Omit<CardDetails, "at">) {
   apiRef?.appendEntry<CardDetails>(CARD_TYPE, { ...details, at: Date.now() });
+}
+
+function recordBinding(team: string | null) {
+  const binding: Binding = { team, name: state.self, labels: state.selfLabels ?? [] };
+  const key = JSON.stringify(binding);
+  if (key === lastBinding) return;
+  lastBinding = key;
+  apiRef?.appendEntry<Binding>(BINDING_TYPE, binding);
+}
+
+/** 当前分支上最后一条 Binding。按分支读,被放弃的分支不算数。 */
+function savedBinding(ctx: ExtensionContext): Binding | null {
+  const branch = ctx.sessionManager?.getBranch() ?? [];
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const e = branch[i] as { type?: string; customType?: string; data?: Binding };
+    if (e.type === "custom" && e.customType === BINDING_TYPE && e.data) return e.data;
+  }
+  return null;
 }
 
 function renderStatus() {
@@ -531,6 +563,7 @@ function connectWith(
   });
 
   transport.start({ name: state.self, labels: state.selfLabels, host: safeHostname() });
+  recordBinding(team);
   renderStatus();
 }
 
@@ -592,17 +625,25 @@ export default function (pi: ExtensionAPI) {
     // 已发消息记录不能带过来。reload 是在同一会话上重载扩展,状态应当保留。
     // 以前只重置 self / selfLabels / reply,于是 fork 之后会拿着上一个会话的
     // pendingReplies 去提醒模型回复一条它从未见过的请求。
-    if ((event as { reason?: string })?.reason !== "reload") {
+    //
+    // resume 回到同一段对话,也回到同一个 team、同一个名字。fork 不重连:
+    // 两个分支拿着同一个名字会互相顶掉。命令行和环境变量仍然优先。
+    const reason = (event as { reason?: string })?.reason;
+    const saved = reason === "resume" ? savedBinding(ctx) : null;
+    if (reason !== "reload") {
       state = createSessionState(state.self);
+      lastBinding = saved ? JSON.stringify(saved) : "";
     }
 
     state.self =
       (pi.getFlag("team-name") as string) ??
       process.env.TEAM_NAME ??
+      saved?.name ??
       process.cwd().split("/").filter(Boolean).pop() ??
       "pi";
 
-    const labels = (pi.getFlag("team-labels") as string) ?? process.env.TEAM_LABELS ?? "";
+    const labels =
+      (pi.getFlag("team-labels") as string) ?? process.env.TEAM_LABELS ?? saved?.labels.join(",") ?? "";
     state.selfLabels = labels.split(",").map((s) => s.trim()).filter(Boolean);
 
     // 回信策略。旧名字(TEAM_ANNOUNCE / --team-announce / auto / always)
@@ -631,7 +672,8 @@ export default function (pi: ExtensionAPI) {
       state.reply = "off";
     }
 
-    const team = (pi.getFlag("team") as string) ?? process.env.TEAM ?? "";
+    const explicitTeam = (pi.getFlag("team") as string) ?? process.env.TEAM;
+    const team = explicitTeam ?? saved?.team ?? "";
     const url = (pi.getFlag("team-url") as string) ?? process.env.TEAM_URL ?? "";
     const token = process.env.TEAM_TOKEN ?? "";
     const modeFlag = (pi.getFlag("team-mode") as string) ?? process.env.TEAM_MODE ?? "";
@@ -652,6 +694,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       connectWith(team, r.config);
+      if (explicitTeam === undefined) ctx.ui.notify(`team:按上次会话重新加入 "${team}",节点名 ${state.self}`, "info");
       return;
     }
 
